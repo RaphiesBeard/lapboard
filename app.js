@@ -7,7 +7,8 @@ const DEDUP_MS = 20000;            // two taps on one rider closer than this cou
 const DEFAULT_POINTS = [25,20,16,13,11,10,9,8,7,6,5,4,3,2,1];
 const CATS = {M:"Men", F:"Women"};
 // Race fields that change during a race live in races/RACE/live/KEY, which timekeepers can write.
-const LIVE_FIELDS = new Set(["startAt","status","targetLaps","lapsFrom","checkedIn","dnf","durationMin"]);
+const LIVE_FIELDS = new Set(["startAt","status","targetLaps","lapsFrom","checkedIn","dnf","durationMin","newRiders"]);
+// Riders a timekeeper registers go in the live doc (newRiders) until an organiser's app copies them into the series.
 
 let backend=null, db=null, canWrite=false;
 let mode="public", isAdmin=null, authUser=null, tkKey=null, loaded=false, seriesLoaded=false;
@@ -50,6 +51,7 @@ function setRace(id,fields){pendingRace[id]={...(pendingRace[id]||{}),...fields}
     if(Object.keys(live).length){ if(!keyFor(id))throw new Error("no key for race"); await db.doc(livePath(id)).update(live) }
     if(Object.keys(rest).length) await db.doc("races/"+id).update(rest);
   });render()}
+function nextName(n){ const m=String(n).match(/^(.*?)(\d+)(\D*)$/); return m?m[1]+(+m[2]+1)+m[3]:n+" (copy)" }
 function seriesName(s){return s?s.name:"Series"}
 function ridersOf(s){return Object.entries((s&&s.riders)||{}).map(([id,r])=>({id,...r})).sort((a,b)=>a.num-b.num)}
 function arm(key,fn){ if(armed===key){armed=null;clearTimeout(armTimer);fn();return;}
@@ -181,19 +183,40 @@ function subTaps(raceId){
     tapDocs=next; onData();
   },e=>console.error(e));
 }
-function onData(){ if(view.screen==="race"&&view.tab==="timing"&&$("#grid")){ if(timingRenderKey()!==timingKey)render(); else liveUpdate(); } else render(); }
+function mergeNewRiders(){
+  for(const rid in races){ const race=getRace(rid), nr=race&&race.newRiders, s=race&&series[race.seriesId];
+    if(!nr||!nr.length||!s) continue;
+    const missing=nr.filter(r=>!(s.riders||{})[r.id]);
+    if(missing.length){ const add={}; missing.forEach(r=>add[r.id]={name:r.name,num:r.num,cat:r.cat});
+      series[race.seriesId]={...s,riders:{...add,...(s.riders||{})}};
+      if(admin()) enqueue("series/"+race.seriesId,()=>db.doc("series/"+race.seriesId).update({riders:add})); }
+    if(admin()&&keyFor(rid)&&!pendingRace[rid]?.newRiders) { const path=livePath(rid); enqueue("series/"+race.seriesId,()=>db.doc(path).update({newRiders:[]})); lives[rid]={...(lives[rid]||{}),newRiders:[]}; }
+  }
+}
+function onData(){ mergeNewRiders(); if(view.screen==="race"&&view.tab==="timing"&&$("#grid")){ if(timingRenderKey()!==timingKey)render(); else liveUpdate(); } else render(); }
 
 /* ---------- navigation ---------- */
 const admin=()=>mode==="admin"&&isAdmin===true;
-function go(v){ view={...view,...v}; armed=null; dnfMode=false;
-  if(mode==="public"){ const h=view.screen==="race"?"#/r/"+view.raceId:view.screen==="series"?"#/s/"+view.seriesId:view.screen==="help"?"#/help"+(view.tab?"/"+view.tab:""):"#/";
-    if(location.hash!==h) history.replaceState(null,"",h); }
+// Navigation uses the browser history, so the phone's back gesture and the browser's
+// back and forward buttons move between screens and tabs.
+const NAV_KEYS=["screen","seriesId","raceId","tab","back","editRider"];
+const navState=()=>{ const o={}; NAV_KEYS.forEach(k=>o[k]=view[k]??null); return o };
+const navHash=()=>mode!=="public"?location.hash:view.screen==="race"?"#/r/"+view.raceId:view.screen==="series"?"#/s/"+view.seriesId:view.screen==="help"?"#/help"+(view.tab?"/"+view.tab:""):view.screen==="find"?"#/find":"#/";
+let navDepth=0;
+function go(v,opts={}){ const before=JSON.stringify(navState());
+  view={...view,madeLogin:null,editRider:null,...v}; armed=null; dnfMode=false;
+  if(!opts.fromHistory&&JSON.stringify(navState())!==before){
+    const h=navHash();
+    if(opts.replace) history.replaceState({lb:navState(),depth:navDepth},"",h);
+    else { navDepth++; history.pushState({lb:navState(),depth:navDepth},"",h); } }
   if(view.screen==="race"&&view.raceId){ subLive(view.raceId); subTaps(view.raceId); }
-  window.scrollTo(0,0); render(); }
+  if(!opts.keepScroll) window.scrollTo(0,0); render(); }
+window.addEventListener("popstate",e=>{ const st=e.state; if(!st||!st.lb)return;
+  navDepth=st.depth||0; go(st.lb,{fromHistory:true}); });
 
 /* ---------- render ---------- */
 function header(crumbs,title,right,tabs){
-  return `<div class="top"><div class="crumbs">${crumbs.map(c=>c.go?`<button data-go='${esc(JSON.stringify(c.go))}'>${esc(c.label)}</button>`:`<span>${esc(c.label)}</span>`).join("<span>/</span>")}</div>
+  return `<div class="top"><div class="crumbs">${navDepth>0?`<button class="navback" data-act="navback" aria-label="Back">‹ Back</button><span class="sep" aria-hidden="true">·</span>`:""}${crumbs.map(c=>c.go?`<button data-go='${esc(JSON.stringify(c.go))}'>${esc(c.label)}</button>`:`<span>${esc(c.label)}</span>`).join("<span>/</span>")}</div>
   <div class="titlerow"><h1>${esc(title)}</h1>${right||""}</div>
   ${tabs?`<div class="tabs" role="tablist">${tabs.map(t=>`<button data-tab="${t.id}" aria-current="${view.tab===t.id}">${t.label}</button>`).join("")}</div>`:""}</div>`;
 }
@@ -211,6 +234,7 @@ function render(){
   else if(view.screen==="home") app.innerHTML=renderHome();
   else if(view.screen==="orgs") app.innerHTML=admin()?renderOrgs():renderHome();
   else if(view.screen==="series") app.innerHTML=renderSeries();
+  else if(view.screen==="find") app.innerHTML=renderFind();
   else app.innerHTML=renderRace();
   app.insertAdjacentHTML("beforeend",footer());
   if(view.screen==="race"&&view.tab==="timing") { timingKey=timingRenderKey(); stripKey=""; liveUpdate(); }
@@ -224,12 +248,35 @@ function renderHome(){
       <div class="small muted">${s.kind==="oneday"?"One-day race":"Series"} · ${n} riders · ${rc} race${rc===1?"":"s"}</div></button>
       <span class="muted" aria-hidden="true">›</span></div>`}).join("")}</div>`
     :`<div class="card empty">${admin()?"No series yet. Create one below, for example “Biscuit Cup 2026”.":"No results yet."}</div>`}
+  <div class="row"><button class="btn" data-go='${esc(JSON.stringify({screen:"find"}))}'>Find a rider</button></div>
   ${admin()?`<form class="card" id="newSeries"><h2>New series or one-day race</h2>
     <div class="row" style="margin-top:10px;align-items:flex-end">
       <label class="f">Name<input type="text" id="ns-name" required placeholder="Die Goldene Ananas 2026"></label>
       <label class="f" style="flex:0 1 170px">Type<select id="ns-kind"><option value="series">Series (several races)</option><option value="oneday">One-day race</option></select></label>
+      ${list.length?`<label class="f" style="flex:0 1 220px">Riders<select id="ns-copy"><option value="">Start with no riders</option>${list.map(([id,s])=>`<option value="${id}">Copy riders from ${esc(s.name)}</option>`).join("")}</select></label>`:""}
       <button class="btn primary" type="submit">Create</button></div></form>`:""}
+  ${admin()?`<div class="row"><button class="btn sm ghost" data-act="example">Add an example series to practise with</button></div>`:""}
   ${admin()?renderArchive():""}
+  </div>`;
+}
+// Riders are matched across series by name, so someone keeps one history even with different numbers.
+const personKey=n=>String(n||"").trim().toLowerCase().replace(/\s+/g," ");
+function renderFind(){
+  const q=personKey(view.fq), people={};
+  if(q) for(const rid of Object.keys(races)){ const r=getRace(rid), s=series[r.seriesId];
+    if(!r.published||r.archived||!s||s.archived) continue;
+    for(const cat in r.published.rows) for(const row of r.published.rows[cat]){
+      if(!personKey(row.name).includes(q)&&String(row.num)!==q) continue;
+      const k=personKey(row.name); (people[k]=people[k]||{name:row.name,res:[]}).res.push({rid,race:r,s,cat,row}) } }
+  const list=Object.values(people).sort((a,b)=>a.name.localeCompare(b.name));
+  list.forEach(p=>p.res.sort((a,b)=>String(b.race.date).localeCompare(String(a.race.date))));
+  const wins=p=>p.res.filter(x=>x.row.pos==="1").length;
+  return header([{label:"Lapboard",go:{screen:"home"}}],"Find a rider")+`<div class="stack">
+  <input type="text" id="find-q" placeholder="Type a name or number" value="${esc(view.fq||"")}" autocomplete="off">
+  ${!q?`<p class="note">Search every published result, across all series and one-day races.</p>`:list.length?list.slice(0,30).map(p=>`<div class="card"><div class="spread"><h2>${esc(p.name)}</h2><span class="small muted">${p.res.length} race${p.res.length===1?"":"s"} · ${wins(p)} win${wins(p)===1?"":"s"}</span></div>
+    <div class="tbl-wrap"><table><thead><tr><th>Race</th><th>Pos</th><th class="r">Gap</th></tr></thead><tbody>
+    ${p.res.map(x=>`<tr><td><button class="link" style="text-align:left" data-go='${esc(JSON.stringify({screen:"race",raceId:x.rid,seriesId:x.race.seriesId,tab:"results"}))}'><b>${esc(x.race.name)}</b><div class="small muted">${esc(x.s.name)} · ${esc(x.race.date||"")} · ${CATS[x.cat]} · #${x.row.num}</div></button></td><td class="pos">${esc(x.row.pos)}</td><td class="r t">${esc(x.row.gap)}</td></tr>`).join("")}
+    </tbody></table></div></div>`).join(""):`<div class="card empty">No published results match “${esc(view.fq)}”.</div>`}
   </div>`;
 }
 function renderArchive(){
@@ -243,19 +290,33 @@ function renderArchive(){
     ${ar.map(([rid,r])=>row(r.name,`${series[r.seriesId].name} · ${r.date||""}`,`data-restorerace="${rid}"`,`data-delrace="${rid}"`,"delrace-"+rid)).join("")}
   </div></details>`;
 }
+const loginDomain=()=>(backend&&backend.loginDomain)||"";
+const isUsername=e=>!!loginDomain()&&e.endsWith("@"+loginDomain());
+const displayLogin=e=>isUsername(e)?e.slice(0,-(loginDomain().length+1)):e;
 function renderOrgs(){
   const me=(authUser&&authUser.email||"").toLowerCase(), owner=ownerEmails.includes(me);
   const list=(organisers.emails||[]);
+  const made=view.madeLogin;
   return header([{label:"Lapboard",go:{screen:"home"}}],"Organisers",null)+`<div class="stack">
-  <div class="card"><p class="note" style="margin-bottom:8px">Organisers sign in with their Google account and can manage series, riders, races and results.</p>
+  <div class="card"><p class="note" style="margin-bottom:8px">Organisers can manage series, riders, races and results.</p>
   <div class="list">${ownerEmails.map(e=>`<div class="item"><div class="grow">${esc(e)}</div><span class="pill">Owner</span></div>`).join("")}
-  ${list.map(e=>`<div class="item"><div class="grow">${esc(e)}</div>${owner?`<button class="btn sm ${armed==="rmorg-"+e?"arm":"ghost"}" data-rmorg="${esc(e)}">${armLabel("rmorg-"+e,"Remove","Confirm")}</button>`:""}</div>`).join("")}</div></div>
-  ${owner?`<form class="card" id="addOrg"><h2>Add an organiser</h2><div class="row" style="margin-top:10px;align-items:flex-end">
+  ${list.map(e=>`<div class="item"><div class="grow">${esc(displayLogin(e))}</div><span class="pill">${isUsername(e)?"Username":"Google"}</span>${owner?`<button class="btn sm ${armed==="rmorg-"+e?"arm":"ghost"}" data-rmorg="${esc(e)}">${armLabel("rmorg-"+e,"Remove","Confirm")}</button>`:""}</div>`).join("")}</div></div>
+  ${made?`<div class="card" style="border-color:var(--ok)"><h2>Login created</h2><p class="note" style="margin:6px 0 10px">Send these to ${esc(made.username)}. They sign in at the organiser page. You won't be able to see the password again.</p>
+    <div class="linkbox"><code>${esc(made.text)}</code><button class="btn sm primary" data-act="sharelogin">Share</button><button class="btn sm" data-act="copylogin">Copy</button></div></div>`:""}
+  ${owner?`<form class="card" id="addLogin"><h2>Create a username and password</h2><p class="note" style="margin:6px 0 10px">For organisers who don't want to use a Google account.</p>
+    <div class="row" style="align-items:flex-end">
+    <label class="f">Username<input type="text" id="lg-user" required autocomplete="off" autocapitalize="none" placeholder="sam"></label>
+    <label class="f">Password<input type="text" id="lg-pass" required autocomplete="off" minlength="8" value="${esc(suggestPassword())}"></label>
+    <button class="btn primary" type="submit">Create login</button></div></form>
+  <form class="card" id="addOrg"><h2>Add a Google account</h2><div class="row" style="margin-top:10px;align-items:flex-end">
     <label class="f">Their Google account email<input type="email" id="org-email" required autocomplete="off" placeholder="friend@gmail.com"></label>
-    <button class="btn primary" type="submit">Add</button></div><p class="note" style="margin-top:8px">They can sign in straight away at the organiser page: ${esc(location.origin+location.pathname)}#/admin</p></form>`
+    <button class="btn primary" type="submit">Add</button></div></form>
+  <p class="note">Organisers sign in at ${esc(location.origin+location.pathname)}#/admin</p>`
     :`<p class="note">Only the owner can add or remove organisers.</p>`}
   </div>`;
 }
+function suggestPassword(){ if(!suggestPassword.v){ const w=["mud","crank","spoke","bell","cowbell","barrier","sandpit","frites","wafel","knobby","flyover","runup","plank","tubular"];
+  const r=n=>crypto.getRandomValues(new Uint32Array(1))[0]%n; suggestPassword.v=w[r(w.length)]+"-"+w[r(w.length)]+"-"+(100+r(900)); } return suggestPassword.v }
 function renderSeries(){
   const s=series[view.seriesId], id=view.seriesId;
   const tabs=[{id:"races",label:"Races"},{id:"riders",label:"Riders"},{id:"standings",label:s.kind==="oneday"?"Results":"Standings"}];
@@ -278,8 +339,15 @@ function renderSeries(){
     const rs=ridersOf(s);
     body=`${admin()?riderForm("addRider","Register a rider",s):""}
     <div class="card"><div class="spread"><h3>${rs.length} registered</h3><span class="small muted">${rs.filter(r=>r.cat==="M").length} men · ${rs.filter(r=>r.cat==="F").length} women</span></div>
-    <div class="list" style="margin-top:6px">${rs.map(r=>`<div class="item"><span class="plate-sm">${r.num}</span><div class="grow">${esc(r.name)}</div><span class="pill">${CATS[r.cat]||r.cat}</span>
-      ${admin()?`<button class="btn sm ${armed==="del-"+r.id?"arm":"ghost"}" data-delrider="${r.id}">${armLabel("del-"+r.id,"Remove","Confirm")}</button>`:""}</div>`).join("")||`<div class="empty">No riders yet.</div>`}</div></div>`;
+    <div class="list" style="margin-top:6px">${rs.map(r=>view.editRider===r.id?`<form class="item" id="editRider" data-rid="${r.id}" style="flex-wrap:wrap">
+        <label class="f" style="flex:0 1 80px">Number<input type="number" id="er-num" min="1" value="${r.num}"></label>
+        <label class="f">Name<input type="text" id="er-name" value="${esc(r.name)}" required></label>
+        <label class="f" style="flex:0 1 110px">Category<select id="er-cat"><option value="M" ${r.cat==="M"?"selected":""}>Men</option><option value="F" ${r.cat==="F"?"selected":""}>Women</option></select></label>
+        <div class="row"><button class="btn sm primary" type="submit">Save</button><button class="btn sm ghost" type="button" data-act="canceledit">Cancel</button>
+        <button class="btn sm ${armed==="del-"+r.id?"arm":"danger"}" type="button" data-delrider="${r.id}">${armLabel("del-"+r.id,"Remove rider","Tap again to remove")}</button></div></form>`
+      :`<div class="item"><span class="plate-sm">${r.num}</span><div class="grow">${esc(r.name)}</div><span class="pill">${CATS[r.cat]||r.cat}</span>
+      ${admin()?`<button class="btn sm ghost" data-editrider="${r.id}">Edit</button>`:""}</div>`).join("")||`<div class="empty">No riders yet.</div>`}</div>
+    ${admin()?`<p class="note" style="margin-top:8px">Changes apply to future results. Published results keep the details they were published with until you republish.</p>`:""}</div>`;
   } else if(view.tab==="standings"){
     body=renderStandings(s,id,rl.map(([rid])=>getRace(rid)));
   } else {
@@ -288,6 +356,8 @@ function renderSeries(){
       <label class="f">Points for 1st, 2nd, 3rd… (comma separated, per category)<input type="text" id="ss-points" value="${esc((s.points||DEFAULT_POINTS).join(", "))}"></label>
       <p class="note">Positions beyond the list score 0. DNF and DNS score 0. This is a placeholder table until the series scoring is decided.</p>
       <div><button class="btn primary" type="submit">Save settings</button></div></div></form>
+    <form class="card" id="copySeries"><h2>Copy this series</h2><p class="note" style="margin:6px 0 10px">Starts a new series with the same riders, numbers and points table, but no races. Handy for next season.</p>
+      <div class="row" style="align-items:flex-end"><label class="f">New name<input type="text" id="cs-name" value="${esc(nextName(s.name))}" required></label><button class="btn primary" type="submit">Copy</button></div></form>
     <div class="card"><h2>Archive</h2><p class="note" style="margin:6px 0 10px">Archived races and series disappear from the lists and public pages. You can restore them from the Archive on the home screen.</p>
       <div class="list">${rl.map(([rid])=>{const r=getRace(rid);return `<div class="item"><div class="grow">${esc(r.name)} <span class="small muted">${esc(r.date||"")}</span></div>
         <button class="btn sm" data-archrace="${rid}">Archive race</button></div>`}).join("")||`<div class="small muted">No races in this series.</div>`}</div>
@@ -341,17 +411,22 @@ function tkLinkCard(race){
   <div class="row" style="margin-top:8px"><button class="btn sm ${armed==="rekey"?"arm":"ghost"}" data-act="rekey">${armLabel("rekey","Make a new link (old one stops working)","Tap again to replace the link")}</button></div></div>`;
 }
 function renderSignIn(){
-  if(isAdmin===false&&authUser) return `<div class="signin card stack"><h1>Not an organiser account</h1><p>${esc(authUser.email)} can't manage races. Sign in with an organiser's Google account, or ask an organiser to add you.</p>
+  if(isAdmin===false&&authUser) return `<div class="signin card stack"><h1>Not an organiser account</h1><p>${esc(displayLogin(authUser.email))} can't manage races. Sign in with an organiser's Google account, or ask an organiser to add you.</p>
     <div class="row" style="justify-content:center"><button class="btn" data-act="signout">Sign out</button><a class="btn ghost" href="#/">Public results</a></div></div>`;
   if(authUser) return `<div class="signin"><p class="muted">Checking your account…</p></div>`;
   return `<div class="signin card stack"><h1>Lapboard organiser</h1><p>Sign in to set up series, register riders, run races and publish results.</p>
     <div class="row" style="justify-content:center"><button class="btn primary" data-act="signin">Sign in with Google</button></div>
+    <form id="pwSignin" class="stack" style="gap:8px;text-align:left;border-top:1px solid var(--line);padding-top:14px">
+      <span class="small muted">Or with a username from the organiser</span>
+      <label class="f">Username<input type="text" id="si-user" autocomplete="username" autocapitalize="none" required></label>
+      <label class="f">Password<input type="password" id="si-pass" autocomplete="current-password" required></label>
+      <button class="btn dark" type="submit">Sign in</button></form>
     <p class="note"><a href="#/">See public results</a></p></div>`;
 }
 function footer(){
   const help=t=>`<button class="btn sm ghost" data-go='${esc(JSON.stringify({screen:"help",tab:t,back:{screen:view.screen,tab:view.tab}}))}'>How to use Lapboard</button>`;
   if(mode==="tk") return `<div class="foot">${help("timekeepers")}<span>This phone records as ${esc(deviceId)}</span></div>`;
-  if(mode==="admin") return `<div class="foot">${help("organisers")}<span>Signed in as ${esc(authUser&&authUser.email)}</span><button class="btn sm ghost" data-act="signout">Sign out</button><a href="#/">Public view</a></div>`;
+  if(mode==="admin") return `<div class="foot">${help("organisers")}<span>Signed in as ${esc(authUser&&displayLogin(authUser.email))}</span><button class="btn sm ghost" data-act="signout">Sign out</button><a href="#/">Public view</a></div>`;
   return `<div class="foot">${help("riders")}<a href="#/admin">Organiser sign-in</a></div>`;
 }
 function renderHelp(){
@@ -366,11 +441,13 @@ function renderHelp(){
     step("Pick your series and race","Each published race lists Men and Women separately, with your position, total time and gap to the winner."),
     step("Reading the gap","<i>+0:42</i> means you finished on the same lap as the winner, 42 seconds behind. <i>−1 lap</i> means the leader lapped you once. The winner's lap count is shown above each table."),
     step("DNF and DNS","DNF means you started but didn't finish. DNS means you were checked in but never crossed the line."),
+    step("Find yourself","Tap <i>Find a rider</i> on the home page and type your name or number to see all your results, across every series."),
     step("Series standings","Open the Standings tab of a series to see points from every published race (R1, R2…) and the running total."),
   ]);
   else if(view.tab==="timekeepers") body=sec("Before the start",[
     step("Open the timekeeper link","The organiser sends it by text or WhatsApp. It works only for that race and needs no account. Tip: add it to your home screen."),
     step("Check riders in","On the Check-in tab, tick everyone who is racing. Only checked-in riders appear on the timing screen. Search by name or number, or tap <i>Check in everyone</i>."),
+    step("New rider on the day","Someone not on the list? Use <i>New rider today</i> at the bottom of Check-in. Give them the next free number. They are checked in straight away and kept in the series for next time."),
     step("Two timekeepers? Split the riders","On the Timing tab, each phone picks a group: Men / Women, or Odd # / Even #. Both phones record into the same race."),
     step("Start the race","Tap <i>Start race</i>, then tap again to confirm, as the riders go. Only one phone needs to do this."),
   ])+sec("During the race",[
@@ -385,21 +462,23 @@ function renderHelp(){
     step("End the race","When everyone is in, tap <i>End race</i> twice. The organiser checks the laps and publishes the results."),
   ]);
   else body=sec("Setting up",[
-    step("Sign in",`Go to the organiser page (<i>${esc(location.origin+location.pathname)}#/admin</i>) and sign in with your Google account.`),
+    step("Sign in",`Go to the organiser page (<i>${esc(location.origin+location.pathname)}#/admin</i>) and sign in with your Google account, or with the username and password the owner gave you.`),
+    step("Practise first","On the home screen, tap <i>Add an example series to practise with</i>. It has 30 made-up riders, a finished race with three mistakes to fix on the Review tab, and a race ready to time. Archive it when you are done."),
     step("Create a series","For example <i>Biscuit Cup 2026</i>. Choose <i>One-day race</i> for a single event like the Intergalactics."),
-    step("Register riders","On the Riders tab, add each rider's name, number and category. Riders keep their number for the whole series."),
+    step("Register riders","On the Riders tab, add each rider's name, number and category. Tap <i>Edit</i> next to a rider to fix a name, number or category. Riders keep their number for the whole series."),
     step("Set the points","On the Settings tab, enter the points for 1st, 2nd, 3rd and so on. They apply to Men and Women separately."),
     step("Add a race","On the Races tab, give it a name, date and length in minutes (for example 45)."),
     step("Send the timekeeper link","Open the race. The Check-in tab has a <i>Timekeeper link</i> card. Tap <i>Share</i> to send it. If a link gets passed around, make a new one and the old one stops working."),
   ])+sec("Race day",[
     step("Check-in and timing","You can do these yourself or leave them to your timekeepers. The steps are the same: see the Timekeepers guide."),
-    step("New rider on the day","On the Check-in tab, use <i>New rider today</i>. They are added to the series and checked in."),
+    step("New rider on the day","On the Check-in tab, use <i>New rider today</i>. They are added to the series and checked in. Timekeepers can do this too, and their new riders appear in the series as soon as you open Lapboard."),
   ])+sec("After the race",[
     step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i>: tap <i>Mark DNF</i> or <i>Add finish now</i>."),
     step("Publish","Tap <i>Publish results</i>. The race appears on the public results page and the series standings update. If you change anything later, tap <i>Republish results</i>."),
     step("Share the results","Send riders the results page address. Each race and series has its own link you can copy from the address bar."),
   ])+sec("Managing",[
-    step("Other organisers","On the home screen, tap <i>Organisers</i>. The owner can add a friend's Gmail address so they can sign in and manage everything."),
+    step("Other organisers","On the home screen, tap <i>Organisers</i>. The owner can create a username and password for someone (tap <i>Share</i> to send them by text or WhatsApp), or add their Gmail address so they sign in with Google. Either way they can manage everything."),
+    step("Next season","In a series' Settings, use <i>Copy this series</i>. The copy keeps every rider, number and the points table, with no races. To repeat a race, open it, then <i>Race details</i> › <i>Duplicate this race</i>."),
     step("Archive","In a series' Settings, archive a race or the whole series. Archived items are hidden from everyone. Restore them from <i>Archive</i> on the home screen, which is also the only place to delete something for good."),
   ]);
   return header([{label:"Lapboard",go:back}],"How to use Lapboard",null,tabs)+`<div class="stack">${body}<div><button class="btn" data-go='${esc(JSON.stringify(back))}'>Back</button></div></div>`;
@@ -410,12 +489,19 @@ function renderCheckin(race,s){
   const shown=rs.filter(r=>!q||r.name.toLowerCase().includes(q)||String(r.num)===q);
   return `<div class="stack">
   ${admin()?tkLinkCard(race):""}
+  ${admin()?`<details class="card" id="d-racedetails" ${openDetails["d-racedetails"]?"open":""}><summary style="cursor:pointer;font-weight:600">Race details</summary>
+    <form id="raceDetails" class="row" style="margin-top:10px;align-items:flex-end">
+      <label class="f">Name<input type="text" id="rd-name" value="${esc(race.name)}" required></label>
+      <label class="f" style="flex:0 1 150px">Date<input type="date" id="rd-date" value="${esc(race.date||"")}"></label>
+      <label class="f" style="flex:0 1 100px">Minutes<input type="number" id="rd-min" min="5" max="180" value="${race.durationMin||45}"></label>
+      <button class="btn primary" type="submit">Save</button></form>
+    <div class="row" style="margin-top:10px"><button class="btn sm" data-act="duprace">Duplicate this race</button><span class="small muted">Same length and the same riders checked in, with no times.</span></div></details>`:""}
   <div class="spread"><div><b class="num" style="font-family:var(--display);font-size:26px">${inn.size}</b> <span class="muted">of ${rs.length} checked in · ${rs.filter(r=>inn.has(r.id)&&r.cat==="M").length} men, ${rs.filter(r=>inn.has(r.id)&&r.cat==="F").length} women</span></div>
   <div class="row"><button class="btn sm" data-act="checkall">Check in everyone</button><button class="btn sm ghost" data-act="checknone">Clear</button></div></div>
   <input type="text" id="ci-search" placeholder="Search name or number" value="${esc(view.q||"")}" autocomplete="off">
   <div class="card list">${shown.map(r=>`<label class="item" style="cursor:pointer"><input type="checkbox" data-check="${r.id}" ${inn.has(r.id)?"checked":""} style="width:22px;height:22px"><span class="plate-sm">${r.num}</span><span class="grow">${esc(r.name)}</span><span class="pill">${CATS[r.cat]}</span></label>`).join("")||`<div class="empty">No riders match.</div>`}</div>
-  ${admin()?`${riderForm("newAtCheckin","New rider today",s)}
-  <p class="note">New riders are added to the series with their number and checked in to this race.</p>`:`<p class="note">Someone missing from the list? The organiser can register new riders and they'll appear here straight away.</p>`}
+  ${riderForm("newAtCheckin","New rider today",s)}
+  <p class="note">New riders are added to the series with their number${admin()?"":" (the organiser sees them too)"} and checked in to this race.</p>
   ${race.status==="setup"||!race.status?`<div><button class="btn dark" data-go='${esc(JSON.stringify({tab:"timing"}))}'>Go to timing</button></div>`:""}
   </div>`;
 }
@@ -530,6 +616,42 @@ function renderResults(race,s){
     <p class="note">Published ${new Date(pub.at).toLocaleDateString()} · ${race.durationMin||45} minute race</p></div>`;
 }
 
+/* ---------- example series ---------- */
+// Made-up riders and a finished race with a few planted mistakes, so organisers can practise reviewing.
+function buildExample(){
+  let seed=7; const rnd=()=>{seed=(seed*16807)%2147483647;return seed/2147483647};
+  const first=["Ada","Bram","Cleo","Dirk","Elsa","Finn","Greta","Hugo","Ines","Joost","Kaat","Lars","Mila","Noor","Otto","Pia","Quinn","Ruud","Saar","Tijn","Uma","Vince","Wies","Xander","Yara","Zeb","Fleur","Joep","Lotte","Mats"];
+  const last=["Kettle","Spoke","Mudd","Crank","Biscotti","Sprocket","Derailleur","Tubular","Cantilever","Barrier","Runup","Plank","Puddle","Chainring","Sandpit","Hopper","Bell","Flyover","Gravel","Cowbell","Frites","Wafel","Knobby","Dismount","Remount","Shoulder","Slick","Clincher","Toeclip","Bonk"];
+  const fem=new Set(["Ada","Cleo","Elsa","Greta","Ines","Kaat","Mila","Noor","Pia","Saar","Uma","Wies","Yara","Fleur","Lotte"]);
+  const riders={}, ids=[];
+  first.forEach((f,i)=>{const id="ex"+String(i+1).padStart(2,"0"); ids.push(id); riders[id]={name:`${f} ${last[i]}`,num:i+1+(i>=20?10:0),cat:fem.has(f)?"F":"M"}});
+  const d=new Date(); d.setDate(d.getDate()-7); d.setHours(10,0,0,0); const start=d.getTime();
+  const pace={}, cr={}; ids.forEach(id=>pace[id]=270000+rnd()*90000+(riders[id].cat==="F"?20000:0));
+  ids.forEach(id=>{ let t=start; cr[id]=[]; for(let l=0;l<20;l++){ t+=(l===0?pace[id]*1.15:pace[id])*(0.97+rnd()*0.06); cr[id].push(Math.round(t)) } });
+  const leader=ids.reduce((a,b)=>cr[a][1]<cr[b][1]?a:b), lap2=cr[leader][1]-cr[leader][0], e2=cr[leader][1]-start;
+  let N=2,best=Infinity; for(let k=2;k<40;k++){const x=Math.abs(e2+(k-2)*lap2-2700000); if(x<best){best=x;N=k}}
+  const finishAt=cr[leader][N-1], absent=["ex29","ex30"], taps=[]; let n=0;
+  ids.forEach(id=>{ if(absent.includes(id))return;
+    for(let i=0;i<cr[id].length;i++){ const t=cr[id][i];
+      if(id==="ex17"&&i>=3)break;                      // stops after 3 laps: no finish
+      if(id==="ex05"&&i===4)continue;                   // timekeeper missed a lap
+      taps.push({id:"ex-"+(n++),r:id,t}); if(id==="ex12"&&i===2)taps.push({id:"ex-"+(n++),r:id,t:t+60000}); // stray extra tap
+      if(t>=finishAt)break; } });
+  return {riders, start, N, lap2:Math.round(lap2), date:d.toISOString().slice(0,10), checked:ids.filter(id=>!absent.includes(id)), practice:ids.slice(0,26), taps};
+}
+async function loadExample(){
+  const ex=buildExample();
+  const ref=db.collection("series").doc();
+  await ref.set({name:"Biscuit Cup (example)",kind:"series",points:DEFAULT_POINTS,riders:ex.riders,createdAt:Date.now()});
+  series[ref.id]={name:"Biscuit Cup (example)",kind:"series",points:DEFAULT_POINTS,riders:ex.riders,createdAt:Date.now()};
+  const r1=await createRace({seriesId:ref.id,name:"Round 1 (example)",date:ex.date,durationMin:45});
+  await db.doc(livePath(r1)).update({status:"done",startAt:ex.start,targetLaps:ex.N,lapsFrom:ex.lap2,checkedIn:ex.checked});
+  await db.doc(livePath(r1)+"/taps/example").set({device:"example",taps:ex.taps});
+  const r2=await createRace({seriesId:ref.id,name:"Practice round",date:new Date().toISOString().slice(0,10),durationMin:45});
+  await db.doc(livePath(r2)).update({checkedIn:ex.practice});
+  return ref.id;
+}
+
 /* ---------- races and keys ---------- */
 const newKey=()=>Array.from(crypto.getRandomValues(new Uint8Array(15)),b=>"abcdefghijkmnpqrstuvwxyz23456789"[b%32]).join("");
 async function createRace(fields){
@@ -580,6 +702,7 @@ document.addEventListener("click",e=>{
   if(t.dataset.tap){ if(!t.disabled) tap(t.dataset.tap); return }
   if(t.dataset.undo){ undoTap(t.dataset.undo); return }
   if(t.dataset.filter){ myFilter=t.dataset.filter; try{localStorage.setItem("lb-filter",myFilter)}catch(e){} render(); return }
+  if(t.dataset.editrider){ view.editRider=t.dataset.editrider; armed=null; render(); const el=$("#er-name"); if(el)el.focus(); return }
   if(t.dataset.delrider){ const id=t.dataset.delrider; arm("del-"+id,()=>{ const s=series[view.seriesId]; const riders={...s.riders}; delete riders[id];
       enqueue("series/"+view.seriesId,()=>db.doc("series/"+view.seriesId).set({...s,riders})); series[view.seriesId]={...s,riders}; render(); }); return }
   if(t.dataset.dnf){ toggleDnf(t.dataset.dnf); return }
@@ -607,10 +730,20 @@ document.addEventListener("click",e=>{
   const race=view.raceId?getRace(view.raceId):null;
   if(act==="signin"){ backend.signIn().catch(e=>{console.error(e);toast("Sign-in didn't complete. Try again")}); return }
   if(act==="signout"){ backend.signOut().then(()=>location.hash="#/"); return }
+  if(act==="copylogin"||act==="sharelogin"){ const txt=view.madeLogin&&view.madeLogin.text; if(!txt)return;
+    if(act==="sharelogin"&&navigator.share){ navigator.share({title:"Lapboard organiser login",text:txt}).catch(()=>{}); return }
+    (navigator.clipboard?navigator.clipboard.writeText(txt):Promise.reject()).then(()=>toast("Login copied"),()=>toast("Select the text and copy it")); return }
   if(act==="copylink"){ const u=tkUrl(race); (navigator.clipboard?navigator.clipboard.writeText(u):Promise.reject()).then(()=>toast("Link copied"),()=>toast("Select the link and copy it")); return }
   if(act==="sharelink"){ const u=tkUrl(race);
     if(navigator.share) navigator.share({title:"Lapboard timekeeper: "+race.name,text:"Timekeeping link for "+race.name+":",url:u}).catch(()=>{});
     else (navigator.clipboard?navigator.clipboard.writeText(u):Promise.reject()).then(()=>toast("Link copied"),()=>toast("Select the link and copy it")); return }
+  if(act==="canceledit"){ view.editRider=null; render(); return }
+  if(act==="navback"){ history.back(); return }
+  if(act==="duprace"){ const race=getRace(view.raceId); toast("Duplicating…");
+    enqueue("races/new",async()=>{ const rid=await createRace({seriesId:race.seriesId,name:nextName(race.name.replace(/\(copy\)$/,"").trim()),date:new Date().toISOString().slice(0,10),durationMin:race.durationMin||45});
+      lives[rid]={...lives[rid],checkedIn:[...(race.checkedIn||[])]}; await db.doc(livePath(rid)).update({checkedIn:[...(race.checkedIn||[])]});
+      toast("Race duplicated"); go({screen:"race",raceId:rid,tab:"checkin"}) }); return }
+  if(act==="example"){ toast("Adding example series…"); enqueue("example",async()=>{ const sid=await loadExample(); toast("Example series added"); go({screen:"series",seriesId:sid,tab:"races"}) }); return }
   if(act==="rekey"){ arm("rekey",()=>rekey(race.id)); return }
   if(act==="start") arm("start",()=>{ setRace(race.id,{startAt:Date.now(),status:"running",targetLaps:null}); requestWake(); toast("Race started") });
   else if(act==="end") arm("end",()=>{ setRace(race.id,{status:"done"}); go({tab:admin()?"review":"timing"}) });
@@ -634,11 +767,15 @@ document.addEventListener("change",e=>{
   if(t.dataset.check){ const race=getRace(view.raceId); const set=new Set(race.checkedIn||[]); t.checked?set.add(t.dataset.check):set.delete(t.dataset.check); setRace(race.id,{checkedIn:[...set]}) }
   if(t.id==="dur"){ const v=Math.max(5,Math.min(180,+t.value||45)); setRace(view.raceId,{durationMin:v}) }
 });
-document.addEventListener("input",e=>{ if(e.target.id==="ci-search"){ view.q=e.target.value; const pos=e.target.selectionStart; render(); const el=$("#ci-search"); el.focus(); try{el.setSelectionRange(pos,pos)}catch(_){} } });
+document.addEventListener("input",e=>{ if(e.target.id==="ci-search"||e.target.id==="find-q"){ const id=e.target.id; view[id==="find-q"?"fq":"q"]=e.target.value; const pos=e.target.selectionStart; render(); const el=$("#"+id); el.focus(); try{el.setSelectionRange(pos,pos)}catch(_){} } });
 document.addEventListener("submit",async e=>{
   e.preventDefault(); const f=e.target;
-  if(f.id==="newSeries"){ const name=$("#ns-name").value.trim(), kind=$("#ns-kind").value; if(!name)return;
-    const ref=db.collection("series").doc(); await enqueue("series/"+ref.id,()=>ref.set({name,kind,points:DEFAULT_POINTS,riders:{},createdAt:Date.now()}));
+  if(f.id==="newSeries"||f.id==="copySeries"){ const copy=f.id==="copySeries";
+    const name=$(copy?"#cs-name":"#ns-name").value.trim(), from=series[copy?view.seriesId:($("#ns-copy")||{}).value], kind=copy?from.kind:$("#ns-kind").value; if(!name)return;
+    const riders=from?JSON.parse(JSON.stringify(from.riders||{})):{}, points=from&&copy?from.points||DEFAULT_POINTS:DEFAULT_POINTS;
+    const ref=db.collection("series").doc(); await enqueue("series/"+ref.id,()=>ref.set({name,kind,points,riders,createdAt:Date.now()}));
+    series[ref.id]=series[ref.id]||{name,kind,points,riders,createdAt:Date.now()};
+    if(from) toast(`${Object.keys(riders).length} riders copied with their numbers`);
     if(kind==="oneday") await enqueue("races/new",()=>createRace({seriesId:ref.id,name,date:new Date().toISOString().slice(0,10),durationMin:45}));
     go({screen:"series",seriesId:ref.id,tab:"riders"}); }
   if(f.id==="newRace"){ let rid=null;
@@ -648,9 +785,33 @@ document.addEventListener("submit",async e=>{
     const name=$("#"+f.id+"-name").value.trim(), num=+$("#"+f.id+"-num").value, cat=$("#"+f.id+"-cat").value; if(!name||!num)return;
     if(Object.values(s.riders||{}).some(r=>r.num===num)){ toast(`Number ${num} is already taken`); return }
     const rid="r"+uid(); series[sid]={...s,riders:{...(s.riders||{}),[rid]:{name,num,cat}}};
-    enqueue("series/"+sid,()=>db.doc("series/"+sid).update({riders:{[rid]:{name,num,cat}}}));
-    if(f.id==="newAtCheckin"){ const race=getRace(view.raceId); setRace(race.id,{checkedIn:[...(race.checkedIn||[]),rid]}) }
+    if(mode==="tk"){ const race=getRace(view.raceId); setRace(race.id,{newRiders:[...(race.newRiders||[]),{id:rid,name,num,cat}],checkedIn:[...(race.checkedIn||[]),rid]}) }
+    else { enqueue("series/"+sid,()=>db.doc("series/"+sid).update({riders:{[rid]:{name,num,cat}}}));
+      if(f.id==="newAtCheckin"){ const race=getRace(view.raceId); setRace(race.id,{checkedIn:[...(race.checkedIn||[]),rid]}) } }
     toast(`#${num} ${name} added`); render(); const nf=$("#"+f.id+"-name"); if(nf) nf.focus(); }
+  if(f.id==="editRider"){ const rid=f.dataset.rid, sid=view.seriesId, s=series[sid];
+    const name=$("#er-name").value.trim(), num=+$("#er-num").value, cat=$("#er-cat").value; if(!name||!num)return;
+    if(Object.entries(s.riders||{}).some(([id,r])=>id!==rid&&r.num===num)){ toast(`Number ${num} is already taken`); return }
+    series[sid]={...s,riders:{...s.riders,[rid]:{name,num,cat}}};
+    enqueue("series/"+sid,()=>db.doc("series/"+sid).update({riders:{[rid]:{name,num,cat}}}));
+    view.editRider=null; toast(`#${num} ${name} saved`); render(); return }
+  if(f.id==="raceDetails"){ const race=getRace(view.raceId); const name=$("#rd-name").value.trim()||race.name, date=$("#rd-date").value, dur=Math.max(5,Math.min(180,+$("#rd-min").value||45));
+    races[race.id]={...races[race.id],name,date};
+    enqueue("races/"+race.id+"/details",()=>db.doc("races/"+race.id).update({name,date}));
+    if(dur!==race.durationMin) setRace(race.id,{durationMin:dur}); toast("Race details saved"); render(); return }
+  if(f.id==="pwSignin"){ const u=$("#si-user").value.trim().toLowerCase(), pw=$("#si-pass").value;
+    backend.signInWithPassword(u,pw).catch(e=>{ console.error(e); toast(e&&/invalid|wrong|not-found|credential/.test(e.code||"")?"Username or password is wrong":"Sign-in didn't work. Try again") }); return }
+  if(f.id==="addLogin"){ const u=$("#lg-user").value.trim().toLowerCase(), pw=$("#lg-pass").value;
+    if(!/^[a-z0-9._-]{2,30}$/.test(u)){ toast("Usernames use letters, numbers, dots, dashes or underscores"); return }
+    if(pw.length<8){ toast("Use a password of at least 8 characters"); return }
+    const email=u+"@"+loginDomain();
+    if((organisers.emails||[]).includes(email)){ toast(u+" already exists"); return }
+    try{ await backend.createLogin(u,pw); }
+    catch(e){ console.error(e); toast(e&&e.code==="auth/email-already-in-use"?"That username is taken. Pick another":e&&e.code==="auth/operation-not-allowed"?"Username sign-in is switched off in Firebase (Authentication → Sign-in method → Email/Password)":"Couldn't create the login. Try again"); return }
+    const emails=[...(organisers.emails||[]),email]; organisers={emails};
+    await enqueue("config/organisers",()=>db.doc("config/organisers").set({emails}));
+    const text=`Lapboard organiser login\n${location.origin+location.pathname}#/admin\nUsername: ${u}\nPassword: ${pw}`;
+    view.madeLogin={username:u,text}; suggestPassword.v=null; render(); return }
   if(f.id==="addOrg"){ const e=$("#org-email").value.trim().toLowerCase(); if(!e||!e.includes("@"))return;
     if(ownerEmails.includes(e)||(organisers.emails||[]).includes(e)){ toast(e+" is already an organiser"); return }
     const emails=[...(organisers.emails||[]),e]; organisers={emails};
@@ -673,12 +834,14 @@ function parseHash(){ const h=location.hash.replace(/^#\/?/,"").split("/");
   if(h[0]==="t"&&h[1]&&h[2]) return {mode:"tk",raceId:h[1],key:h[2]};
   if(h[0]==="r"&&h[1]) return {mode:"public",view:{screen:"race",raceId:h[1],tab:"results"}};
   if(h[0]==="s"&&h[1]) return {mode:"public",view:{screen:"series",seriesId:h[1],tab:"races"}};
+  if(h[0]==="find") return {mode:"public",view:{screen:"find"}};
   if(h[0]==="help") return {mode:"public",view:{screen:"help",tab:h[1]||"riders"}};
   return {mode:"public",view:{screen:"home"}};
 }
-window.addEventListener("hashchange",()=>{ const p=parseHash();
+// pushState never fires hashchange, and after a back/forward the hash already matches the view.
+window.addEventListener("hashchange",()=>{ if(location.hash===navHash()) return; const p=parseHash();
   if(p.mode!==mode||(p.mode==="tk"&&(p.key!==tkKey||p.raceId!==view.raceId))){ location.reload(); return }
-  if(p.view) go(p.view); });
+  if(p.view) go(p.view,{replace:true}); });
 function startAdmin(){
   backend.onAuth(u=>{ authUser=u; isAdmin=null; if(keysUnsub){keysUnsub();keysUnsub=null}
     if(!u){ render(); return }
@@ -706,5 +869,6 @@ function startAdmin(){
   db.collection("races").onSnapshot(snap=>{ for(const k in races)delete races[k]; snap.docs.forEach(d=>races[d.id]={id:d.id,...d.data()}); loaded=true;
     if(mode==="tk"&&races[view.raceId]&&lives[view.raceId]&&!view.seriesId) view.seriesId=races[view.raceId].seriesId; onData() },e=>console.error(e));
   if(mode==="admin") startAdmin();
+  history.replaceState({lb:navState(),depth:0},"",location.hash||"#/");
   render();
 })();

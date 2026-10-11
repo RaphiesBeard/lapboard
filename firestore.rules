@@ -1,13 +1,17 @@
 rules_version = '2';
 // Lapboard access rules.
 // - Anyone can read series, races and published results.
-// - Owners (listed below) and organisers (added by an owner in the app) can change everything.
+// - Owners (listed below) and organisers (added by an owner in the app, by Google email or username) can change everything.
 // - Only owners can add or remove organisers, so an owner can't be locked out.
 // - A timekeeper link carries a race key; it can read and write that race's live timing data only.
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Google accounts have verified emails. Username logins are created by the owner in the app
+    // as accounts at the project's own auth domain, which no one else can create once taken.
     function signedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
+      return request.auth != null
+        && (request.auth.token.email_verified == true
+          || request.auth.token.email.matches('.*@lapboard-b6c98[.]firebaseapp[.]com'));
     }
     function email() {
       return request.auth.token.email.lower();

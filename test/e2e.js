@@ -17,6 +17,12 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok(await p.isVisible('text=Biscuit Cup 2026'),'public home lists series');
   await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);
   ok(await p.isVisible('text=No published results yet'),'unpublished races hidden from public');
+  await p.goBack();await p.waitForTimeout(150);
+  ok((await p.textContent('h1')).includes('Race results'),'browser back returns to public home');
+  await p.goForward();await p.waitForTimeout(150);
+  ok((await p.textContent('h1')).includes('Biscuit Cup'),'browser forward returns to series');
+  await p.click('[data-act=navback]');await p.waitForTimeout(150);
+  ok((await p.textContent('h1')).includes('Race results'),'on-screen back button works');
   ok(!(await p.isVisible('text=Settings')),'no settings tab for public');
   ok(p.errs.length===0,'public: no errors '+p.errs);
   p=await page('#/help');
@@ -34,7 +40,16 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   await p.click('text=Practice round');await p.waitForTimeout(200);
   ok((await p.textContent('.linkbox code')).endsWith('#/t/bc-r2/k2'),'check-in shows timekeeper link');
   await p.screenshot({path:shots+'/a-checkin.png',fullPage:true});
-  await p.click('.crumbs button >> nth=1');await p.waitForTimeout(100);
+  await p.click('details#d-racedetails summary');await p.fill('#rd-name','Practice round (renamed)');await p.click('#raceDetails button');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>window.__store.get('races/bc-r2').name==='Practice round (renamed)'),'race details can be edited');
+  await p.goBack();await p.waitForTimeout(150);
+  ok((await p.textContent('h1')).includes('Biscuit Cup'),'admin browser back returns to series');
+  await p.click('[data-tab=riders]');await p.waitForTimeout(80);
+  await p.click('[data-editrider=ex01]');await p.fill('#er-name','Ada Kettle-Renamed');await p.fill('#er-num','2');await p.click('#editRider button[type=submit]');await p.waitForTimeout(80);
+  ok(await p.isVisible('text=Number 2 is already taken'),'duplicate number refused on edit');
+  await p.fill('#er-num','99');await p.click('#editRider button[type=submit]');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>{const r=window.__store.get('series/biscuit-cup-example').riders.ex01;return r.name==='Ada Kettle-Renamed'&&r.num===99}),'rider can be edited');
+  await p.click('[data-tab=races]');
   await p.click('text=Round 1 (example)');await p.waitForTimeout(200);
   ok(await p.isVisible('text=3 things to check'),'review flags 3 problems');
   await p.click('text=Add missed lap');await p.waitForTimeout(80);
@@ -47,7 +62,7 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   const liveStatus=await p.evaluate(()=>window.__store.get('races/bc-r1/live/k1').status);
   ok(liveStatus==='published','status written to live doc');
   // new race gets key + live doc
-  await p.click('.crumbs button >> nth=1');await p.waitForTimeout(100);
+  await p.click('.crumbs button:not(.navback) >> nth=1');await p.waitForTimeout(100);
   await p.fill('#nr-name','Round 2');await p.click('text=Add race');await p.waitForTimeout(300);
   const nk=await p.evaluate(()=>{const s=window.__store;const ks=[...s.keys()].filter(k=>k.startsWith('raceKeys/')&&!['raceKeys/bc-r1','raceKeys/bc-r2'].includes(k));
     if(ks.length!==1)return null;const rid=ks[0].split('/')[1];return s.has(`races/${rid}/live/${s.get(ks[0]).key}`)});
@@ -55,7 +70,7 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok(await p.isVisible('text=Timekeeper link'),'new race opens on check-in with link');
   await p.click('[data-act=rekey]');await p.click('[data-act=rekey]');await p.waitForTimeout(300);
   ok(await p.isVisible('text=New link made'),'link can be replaced');
-  await p.click('.crumbs button >> nth=1');await p.click('[data-tab=settings]');await p.waitForTimeout(100);
+  await p.click('.crumbs button:not(.navback) >> nth=1');await p.click('[data-tab=settings]');await p.waitForTimeout(100);
   await p.click('[data-archrace=bc-r2]');await p.waitForTimeout(150);
   ok(await p.evaluate(()=>window.__store.get('races/bc-r2').archived===true),'race archived, not deleted');
   await p.click('[data-tab=races]');ok(!(await p.isVisible('text=Practice round')),'archived race hidden from list');
@@ -72,17 +87,66 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok(await p.evaluate(()=>JSON.stringify(window.__store.get('config/organisers'))==='{"emails":["friend@gmail.com"]}'),'organiser added');
   await p.click('[data-rmorg="friend@gmail.com"]');await p.click('[data-rmorg="friend@gmail.com"]');await p.waitForTimeout(150);
   ok(await p.evaluate(()=>window.__store.get('config/organisers').emails.length===0),'organiser removed');
+  // username login: create as owner, then sign in with it
+  await p.fill('#lg-user','Sam');await p.fill('#lg-pass','mud-bell-123');await p.click('#addLogin button');await p.waitForTimeout(200);
+  ok(await p.isVisible('text=Login created')&&(await p.textContent('.linkbox code')).includes('Username: sam'),'owner creates username login');
+  ok(await p.evaluate(()=>window.__store.get('config/organisers').emails.includes('sam@lapboard-test.firebaseapp.com')),'username added to organisers');
+  await p.click('[data-act=signout]');await p.waitForTimeout(200);
+  await p.goto('about:blank');await p.goto(U+'#/admin');await p.waitForSelector('text=Sign in with Google');
+  // example series (store resets on reload, so sign in as owner again)
+  await p.click('text=Sign in with Google');await p.waitForSelector('[data-act=example]');
+  await p.click('[data-act=example]');await p.waitForTimeout(600);
+  ok(await p.isVisible('text=Round 1 (example)')&&await p.isVisible('text=Practice round'),'example series loaded');
+  await p.click('text=Round 1 (example)');await p.waitForTimeout(300);await p.click('[data-tab=review]');await p.waitForTimeout(150);
+  ok(await p.isVisible('text=3 things to check'),'example race has the 3 practice problems');
   ok(p.errs.length===0,'admin: no errors '+p.errs);
+  // password sign-in flow on a fresh page
+  p=await page('#/admin');
+  await p.evaluate(async()=>{await window.__MOCK_BACKEND.createLogin('sam','pw-12345678');window.__store.set('config/organisers',{emails:['sam@lapboard-test.firebaseapp.com']})});
+  await p.fill('#si-user','sam');await p.fill('#si-pass','wrong');await p.click('#pwSignin button');await p.waitForTimeout(200);
+  ok(await p.isVisible('text=Username or password is wrong'),'wrong password rejected');
+  await p.fill('#si-pass','pw-12345678');await p.click('#pwSignin button');await p.waitForTimeout(300);
+  ok((await p.textContent('h1')).includes('Your series')&&(await p.textContent('.foot')).includes('Signed in as sam'),'username organiser signs in');
+  ok(!(await p.isVisible('#addLogin')),'non-owner organiser cannot create logins');
   // non-organiser account
   p=await page('#/admin',()=>{window.__afterMock=1});
   await p.evaluate(()=>{window.__mockState.user={email:'someone@else.com'};});
   await p.evaluate(()=>window.__MOCK_BACKEND.signIn=async()=>{window.__mockState.authFns.forEach(f=>f({email:'someone@else.com'}))});
   await p.click('text=Sign in with Google');await p.waitForTimeout(300);
   ok(await p.isVisible('text=Not an organiser account'),'non-organiser is refused');
+  // copy a series and duplicate a race
+  p=await page('#/admin');await p.click('text=Sign in with Google');await p.waitForTimeout(300);
+  await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);await p.click('[data-tab=settings]');await p.waitForTimeout(100);
+  ok(await p.inputValue('#cs-name')==='Biscuit Cup 2027 (example)','copy suggests next year');
+  await p.click('#copySeries button');await p.waitForTimeout(400);
+  const cp=await p.evaluate(()=>{const k=[...window.__store.keys()].find(k=>k.startsWith('series/')&&window.__store.get(k).name==='Biscuit Cup 2027 (example)');const s=k&&window.__store.get(k);return s&&{n:Object.keys(s.riders).length,num:s.riders.ex05.num,sid:k.slice(7)}});
+  ok(cp&&cp.n===30&&cp.num===5,'copied series keeps riders and numbers '+JSON.stringify(cp));
+  ok((await p.textContent('h1')).includes('2027'),'opens the copied series');
+  await p.click('.crumbs button:not(.navback) >> nth=0');await p.waitForTimeout(200);
+  await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);await p.click('text=Practice round');await p.waitForTimeout(200);
+  await p.click('#d-racedetails summary');await p.click('[data-act=duprace]');await p.waitForTimeout(500);
+  const dup=await p.evaluate(()=>{const k=[...window.__store.keys()].find(k=>/^races\/[^/]+$/.test(k)&&window.__store.get(k).name==='Practice round (copy)');if(!k)return null;const rid=k.slice(6);const key=window.__store.get('raceKeys/'+rid).key;return {n:window.__store.get('races/'+rid+'/live/'+key).checkedIn.length}});
+  ok(dup&&dup.n===26,'duplicated race keeps check-ins '+JSON.stringify(dup));
+  ok(p.errs.length===0,'copy/duplicate: no errors '+p.errs);
+  // organiser's app copies timekeeper-registered riders into the series
+  p=await page('#/admin');await p.click('text=Sign in with Google');await p.waitForTimeout(300);
+  await p.evaluate(()=>window.__MOCK_BACKEND.db.doc('races/bc-r2/live/k2').update({newRiders:[{id:'rtk1',name:'Kim Fromtk',num:88,cat:'M'}]}));await p.waitForTimeout(400);
+  const prom=await p.evaluate(()=>({s:window.__store.get('series/biscuit-cup-example').riders.rtk1,l:window.__store.get('races/bc-r2/live/k2').newRiders}));
+  ok(prom.s&&prom.s.num===88&&prom.l.length===0,'organiser app moves timekeeper riders into the series '+JSON.stringify(prom));
+  ok(p.errs.length===0,'promotion: no errors '+p.errs);
   // timekeeper
   p=await page('#/t/bc-r2/k2');
   ok(await p.isVisible('text=Practice round'),'timekeeper link opens race');
   ok(!(await p.isVisible('[data-tab=review]')),'timekeeper has no review tab');
+  await p.click('[data-tab=checkin]');await p.waitForTimeout(150);
+  await p.fill('#newAtCheckin-name','Tess Newrider');await p.fill('#newAtCheckin-num','77');await p.selectOption('#newAtCheckin-cat','F');await p.click('#newAtCheckin button');await p.waitForTimeout(300);
+  const tkNew=await p.evaluate(()=>{const l=window.__store.get('races/bc-r2/live/k2');const s=window.__store.get('series/biscuit-cup-example');const r=(l.newRiders||[]).find(r=>r.num===77);return {r,inn:r&&l.checkedIn.includes(r.id),inSeries:Object.values(s.riders).some(x=>x.num===77)}});
+  ok(tkNew.r&&tkNew.r.name==='Tess Newrider'&&tkNew.inn&&!tkNew.inSeries,'timekeeper registers a rider into the live doc and checks them in '+JSON.stringify(tkNew));
+  ok(await p.isVisible('text=Tess Newrider'),'new rider shows on check-in list');
+  await p.fill('#newAtCheckin-name','Dupe');await p.fill('#newAtCheckin-num','77');await p.click('#newAtCheckin button');await p.waitForTimeout(150);
+  ok(await p.isVisible('text=Number 77 is already taken'),'timekeeper cannot reuse a number');
+  await p.click('[data-tab=timing]');await p.waitForTimeout(150);
+  ok(await p.locator('#grid .plate',{hasText:'77'}).count()>0,'new rider appears on timing grid');
   await p.click('[data-act=start]');await p.click('[data-act=start]');await p.waitForTimeout(200);
   for(const n of [3,7,12]){await p.click(`#grid [data-tap] >> text="${n}"`).catch(async()=>{await p.locator('#grid .plate',{hasText:new RegExp('^\\w?'+n)}).first().click()});await p.waitForTimeout(60)}
   await p.waitForTimeout(300);
@@ -107,8 +171,14 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   await p.goto(U+'#/r/bc-r1');await p.waitForTimeout(300);
   ok(await p.isVisible('text=Winner: 10 laps'),'public results page shows published results');
   await p.screenshot({path:shots+'/p-results.png',fullPage:true});
-  await p.click('.crumbs button >> nth=1');await p.waitForTimeout(100);await p.click('[data-tab=standings]');await p.waitForTimeout(100);
+  await p.click('.crumbs button:not(.navback) >> nth=1');await p.waitForTimeout(100);await p.click('[data-tab=standings]');await p.waitForTimeout(100);
   ok(await p.isVisible('text=Pts'),'public standings visible');
+  await p.goto(U+'#/find');await p.waitForTimeout(200);
+  await p.fill('#find-q','ada ket');await p.waitForTimeout(150);
+  ok(await p.isVisible('h2:has-text("Ada Kettle")')&&await p.isVisible('text=Round 1 (example)'),'find a rider shows their results');
+  ok(await p.evaluate(()=>document.activeElement.id==='find-q'),'search box keeps focus while typing');
+  await p.click('#app table button');await p.waitForTimeout(150);
+  ok(await p.isVisible('text=Winner: 10 laps'),'tapping a found result opens the race');
   ok(p.errs.length===0,'public results: no errors '+p.errs);
   await b.close();srv.close();
   console.log(fails?fails+' FAILED':'ALL PASSED');process.exit(fails?1:0);

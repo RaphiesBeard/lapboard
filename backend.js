@@ -3,7 +3,8 @@ import { firebaseConfig, ownerEmails } from "./config.js";
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, collection, query, where,
   getDoc, getDocs, setDoc, deleteDoc, onSnapshot, connectFirestoreEmulator } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut }
+import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, onAuthStateChanged, signOut,
+  signInWithEmailAndPassword, createUserWithEmailAndPassword }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
 export function createBackend() {
@@ -40,8 +41,20 @@ export function createBackend() {
   };
   const db = { doc: (p) => docW(doc(fs, p)), collection: (p) => colW(p) };
 
+  // Username logins are Firebase email/password accounts at the project's own auth domain,
+  // which nobody else can receive mail for, e.g. sam@lapboard-b6c98.firebaseapp.com.
+  const loginDomain = firebaseConfig.authDomain;
+  const toEmail = (u) => u.trim().toLowerCase() + "@" + loginDomain;
   return {
-    db, ownerEmails,
+    db, ownerEmails, loginDomain,
+    signInWithPassword: (u, pw) => signInWithEmailAndPassword(auth, toEmail(u), pw),
+    // Creates the account in a second Firebase app so the owner stays signed in.
+    createLogin: async (u, pw) => {
+      const second = initializeApp(firebaseConfig, "login-" + Date.now());
+      const a2 = getAuth(second);
+      await createUserWithEmailAndPassword(a2, toEmail(u), pw);
+      await signOut(a2);
+    },
     onAuth: (fn) => onAuthStateChanged(auth, (u) => fn(u ? { email: u.email, uid: u.uid } : null)),
     signIn: async () => {
       const p = new GoogleAuthProvider();

@@ -24,7 +24,12 @@
       add:async d=>{const r=docW(c+"/"+Math.random().toString(36).slice(2,12));await r.set(d);return r}};
   }
   window.__store=store; window.__mockState=state;
-  window.__MOCK_BACKEND={ownerEmails:["organiser@example.com"],db:{doc:docW,collection:c=>colW(c)},
+  const logins={};
+  window.__MOCK_BACKEND={ownerEmails:["organiser@example.com"],loginDomain:"lapboard-test.firebaseapp.com",
+    createLogin:async(u,pw)=>{const e=u+"@lapboard-test.firebaseapp.com"; if(logins[e]){const err=new Error("taken");err.code="auth/email-already-in-use";throw err} logins[e]=pw},
+    signInWithPassword:async(u,pw)=>{const e=u+"@lapboard-test.firebaseapp.com"; if(logins[e]!==pw){const err=new Error("bad");err.code="auth/invalid-credential";throw err}
+      state.user={email:e,uid:"p-"+u}; state.authFns.forEach(f=>f(state.user))},
+    db:{doc:docW,collection:c=>colW(c)},
     onAuth:fn=>{state.authFns.push(fn);setTimeout(()=>fn(state.user),5)},
     signIn:async()=>{state.user={email:"organiser@example.com",uid:"u1"};state.authFns.forEach(f=>f(state.user))},
     signOut:async()=>{state.user=null;state.authFns.forEach(f=>f(null))}};
