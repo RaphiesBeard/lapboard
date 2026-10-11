@@ -1,0 +1,105 @@
+// End-to-end check of the three modes against the in-memory backend. Run: node test/e2e.js (serves the repo on :8765)
+const {chromium}=require('playwright');const http=require('http');const fs=require('fs');const path=require('path');
+const root=path.resolve(__dirname,'..');
+const srv=http.createServer((q,r)=>{const f=path.join(root,decodeURIComponent(q.url.split('?')[0]));
+  fs.readFile(f,(e,d)=>{if(e){r.writeHead(404);r.end();return}r.writeHead(200,{'content-type':f.endsWith('.js')?'text/javascript':f.endsWith('.css')?'text/css':'text/html'});r.end(d)})}).listen(8765);
+const U='http://localhost:8765/test/mock.html';
+const shots=process.env.SHOTS||'/tmp';
+let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++};
+(async()=>{
+  const b=await chromium.launch();
+  const page=async(hash,init)=>{const p=await b.newPage({viewport:{width:400,height:860}});const errs=[];p.errs=errs;
+    p.on('pageerror',e=>errs.push(e.message));p.on('console',m=>{if(m.type()==='error')errs.push(m.text())});
+    if(init)await p.addInitScript(init);await p.goto(U+hash);await p.waitForTimeout(300);return p};
+  // public
+  let p=await page('#/');
+  ok((await p.textContent('h1')).includes('Race results'),'public home shows results title');
+  ok(await p.isVisible('text=Biscuit Cup 2026'),'public home lists series');
+  await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);
+  ok(await p.isVisible('text=No published results yet'),'unpublished races hidden from public');
+  ok(!(await p.isVisible('text=Settings')),'no settings tab for public');
+  ok(p.errs.length===0,'public: no errors '+p.errs);
+  // admin
+  p=await page('#/admin');
+  ok(await p.isVisible('text=Sign in with Google'),'admin asks to sign in');
+  await p.click('text=Sign in with Google');await p.waitForTimeout(300);
+  ok((await p.textContent('h1')).includes('Your series'),'admin home after sign-in');
+  await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);
+  await p.click('text=Practice round');await p.waitForTimeout(200);
+  ok((await p.textContent('.linkbox code')).endsWith('#/t/bc-r2/k2'),'check-in shows timekeeper link');
+  await p.screenshot({path:shots+'/a-checkin.png',fullPage:true});
+  await p.click('.crumbs button >> nth=1');await p.waitForTimeout(100);
+  await p.click('text=Round 1 (example)');await p.waitForTimeout(200);
+  ok(await p.isVisible('text=3 things to check'),'review flags 3 problems');
+  await p.click('text=Add missed lap');await p.waitForTimeout(80);
+  await p.click('text=Remove that tap');await p.waitForTimeout(80);
+  await p.click('[data-dnf]');await p.waitForTimeout(80);
+  ok(await p.isVisible('text=No problems spotted'),'flags cleared after fixes');
+  await p.click('[data-act=publish]');await p.waitForTimeout(200);
+  const pub=await p.evaluate(()=>window.__store.get('races/bc-r1').published);
+  ok(pub&&pub.rows.M.length+pub.rows.F.length===28,'published rows stored on race doc');
+  const liveStatus=await p.evaluate(()=>window.__store.get('races/bc-r1/live/k1').status);
+  ok(liveStatus==='published','status written to live doc');
+  // new race gets key + live doc
+  await p.click('.crumbs button >> nth=1');await p.waitForTimeout(100);
+  await p.fill('#nr-name','Round 2');await p.click('text=Add race');await p.waitForTimeout(300);
+  const nk=await p.evaluate(()=>{const s=window.__store;const ks=[...s.keys()].filter(k=>k.startsWith('raceKeys/')&&!['raceKeys/bc-r1','raceKeys/bc-r2'].includes(k));
+    if(ks.length!==1)return null;const rid=ks[0].split('/')[1];return s.has(`races/${rid}/live/${s.get(ks[0]).key}`)});
+  ok(nk===true,'new race has a key and live doc');
+  ok(await p.isVisible('text=Timekeeper link'),'new race opens on check-in with link');
+  await p.click('[data-act=rekey]');await p.click('[data-act=rekey]');await p.waitForTimeout(300);
+  ok(await p.isVisible('text=New link made'),'link can be replaced');
+  await p.click('.crumbs button >> nth=1');await p.click('[data-tab=settings]');await p.waitForTimeout(100);
+  await p.click('[data-archrace=bc-r2]');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>window.__store.get('races/bc-r2').archived===true),'race archived, not deleted');
+  await p.click('[data-tab=races]');ok(!(await p.isVisible('text=Practice round')),'archived race hidden from list');
+  await p.click('[data-tab=settings]');await p.click('[data-archseries=biscuit-cup-example]');await p.waitForTimeout(150);
+  ok((await p.textContent('h1')).includes('Your series')&&!(await p.isVisible('.list >> text=Biscuit Cup 2026')),'archived series hidden from home');
+  await p.click('summary:has-text("Archive")');await p.waitForTimeout(80);
+  ok(await p.isVisible('text=Biscuit Cup 2026'),'archive lists the series');
+  await p.click('[data-restoreseries=biscuit-cup-example]');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>!window.__store.get('series/biscuit-cup-example').archived),'series restored');
+  await p.click('[data-delrace=bc-r2]');await p.click('[data-delrace=bc-r2]');await p.waitForTimeout(300);
+  ok(await p.evaluate(()=>!window.__store.has('races/bc-r2')&&!window.__store.has('raceKeys/bc-r2')&&!window.__store.has('races/bc-r2/live/k2')),'archived race deleted forever with its data');
+  await p.click('text=Organisers');await p.waitForTimeout(80);
+  await p.fill('#org-email','Friend@Gmail.com');await p.click('#addOrg button');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>JSON.stringify(window.__store.get('config/organisers'))==='{"emails":["friend@gmail.com"]}'),'organiser added');
+  await p.click('[data-rmorg="friend@gmail.com"]');await p.click('[data-rmorg="friend@gmail.com"]');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>window.__store.get('config/organisers').emails.length===0),'organiser removed');
+  ok(p.errs.length===0,'admin: no errors '+p.errs);
+  // non-organiser account
+  p=await page('#/admin',()=>{window.__afterMock=1});
+  await p.evaluate(()=>{window.__mockState.user={email:'someone@else.com'};});
+  await p.evaluate(()=>window.__MOCK_BACKEND.signIn=async()=>{window.__mockState.authFns.forEach(f=>f({email:'someone@else.com'}))});
+  await p.click('text=Sign in with Google');await p.waitForTimeout(300);
+  ok(await p.isVisible('text=Not an organiser account'),'non-organiser is refused');
+  // timekeeper
+  p=await page('#/t/bc-r2/k2');
+  ok(await p.isVisible('text=Practice round'),'timekeeper link opens race');
+  ok(!(await p.isVisible('[data-tab=review]')),'timekeeper has no review tab');
+  await p.click('[data-act=start]');await p.click('[data-act=start]');await p.waitForTimeout(200);
+  for(const n of [3,7,12]){await p.click(`#grid [data-tap] >> text="${n}"`).catch(async()=>{await p.locator('#grid .plate',{hasText:new RegExp('^\\w?'+n)}).first().click()});await p.waitForTimeout(60)}
+  await p.waitForTimeout(300);
+  const taps=await p.evaluate(()=>{const s=window.__store;const k=[...s.keys()].find(k=>k.startsWith('races/bc-r2/live/k2/taps/'));return k?s.get(k).taps.length:0});
+  ok(taps===3,'timekeeper taps saved under the race key ('+taps+')');
+  const st=await p.evaluate(()=>window.__store.get('races/bc-r2/live/k2').startAt);
+  ok(!!st,'start time saved to live doc');
+  await p.screenshot({path:shots+'/t-timing.png',fullPage:true});
+  await p.click('#d-controls summary');await p.click('[data-act=reset]');await p.click('[data-act=reset]');await p.waitForTimeout(300);
+  ok(await p.evaluate(()=>![...window.__store.keys()].some(k=>k.startsWith('races/bc-r2/live/k2/taps/'))&&!window.__store.get('races/bc-r2/live/k2').startAt),'timekeeper can reset a race');
+  ok(p.errs.length===0,'timekeeper: no errors '+p.errs);
+  p=await page('#/t/bc-r2/wrongkey');await p.waitForTimeout(300);
+  ok(await p.isVisible("text=This link isn't valid any more"),'wrong key shows invalid link');
+  // public results with published data
+  await p.close();
+  p=await b.newPage({viewport:{width:400,height:860}});p.errs=[];p.on('pageerror',e=>p.errs.push(e.message));
+  await p.route('**/test/seed.js',async r=>{const res=await r.fetch();let body=await res.text();body+=`;window.__SEED['races/bc-r1'].published=${JSON.stringify(pub)};`;r.fulfill({response:res,body})});
+  await p.goto(U+'#/r/bc-r1');await p.waitForTimeout(300);
+  ok(await p.isVisible('text=Winner: 10 laps'),'public results page shows published results');
+  await p.screenshot({path:shots+'/p-results.png',fullPage:true});
+  await p.click('.crumbs button >> nth=1');await p.waitForTimeout(100);await p.click('[data-tab=standings]');await p.waitForTimeout(100);
+  ok(await p.isVisible('text=Pts'),'public standings visible');
+  ok(p.errs.length===0,'public results: no errors '+p.errs);
+  await b.close();srv.close();
+  console.log(fails?fails+' FAILED':'ALL PASSED');process.exit(fails?1:0);
+})();

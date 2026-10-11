@@ -1,0 +1,54 @@
+rules_version = '2';
+// Lapboard access rules.
+// - Anyone can read series, races and published results.
+// - Owners (listed below) and organisers (added by an owner in the app) can change everything.
+// - Only owners can add or remove organisers, so an owner can't be locked out.
+// - A timekeeper link carries a race key; it can read and write that race's live timing data only.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    function email() {
+      return request.auth.token.email.lower();
+    }
+    function isOwner() {
+      // Owner emails, lower case. Keep in sync with ownerEmails in config.js.
+      return signedIn() && email() in ["REPLACE_WITH_OWNER_EMAIL"];
+    }
+    function isAdmin() {
+      return isOwner() || (signedIn()
+        && exists(/databases/$(database)/documents/config/organisers)
+        && email() in get(/databases/$(database)/documents/config/organisers).data.emails);
+    }
+    function keyOk(raceId, key) {
+      return exists(/databases/$(database)/documents/raceKeys/$(raceId))
+        && get(/databases/$(database)/documents/raceKeys/$(raceId)).data.key == key;
+    }
+
+    match /config/organisers {
+      allow read: if isAdmin();
+      allow write: if isOwner();
+    }
+    match /series/{seriesId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /races/{raceId} {
+      allow read: if true;
+      allow write: if isAdmin();
+
+      match /live/{key} {
+        allow get, create, update: if isAdmin() || keyOk(raceId, key);
+        allow list, delete: if isAdmin();
+
+        match /taps/{deviceId} {
+          allow read, write: if isAdmin() || keyOk(raceId, key);
+        }
+      }
+    }
+    match /raceKeys/{raceId} {
+      allow read, write: if isAdmin();
+    }
+  }
+}

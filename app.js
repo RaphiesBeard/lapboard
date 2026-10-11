@@ -1,0 +1,657 @@
+// Lapboard: cyclocross lap timing and results.
+// Three modes, picked from the address:
+//   #/            public results (anyone)
+//   #/admin       organiser, signed in with Google (series, riders, races, review, publish)
+//   #/t/RACE/KEY  timekeeper link (check-in and timing for one race, no account)
+const DEDUP_MS = 20000;            // two taps on one rider closer than this count once
+const DEFAULT_POINTS = [25,20,16,13,11,10,9,8,7,6,5,4,3,2,1];
+const CATS = {M:"Men", F:"Women"};
+// Race fields that change during a race live in races/RACE/live/KEY, which timekeepers can write.
+const LIVE_FIELDS = new Set(["startAt","status","targetLaps","lapsFrom","checkedIn","dnf","durationMin"]);
+
+let backend=null, db=null, canWrite=false;
+let mode="public", isAdmin=null, authUser=null, tkKey=null, loaded=false, seriesLoaded=false;
+const series={}, races={}, keys={}, lives={}, liveUnsubs={};
+let tapDocs={};                    // deviceId -> {device, taps:[]}
+let tapsUnsub=null, tapsRaceId=null, keysUnsub=null, orgUnsub=null;
+let organisers={emails:[]}, ownerEmails=[];
+const openDetails={};              // keeps <details> sections open across re-renders
+document.addEventListener("toggle",e=>{ if(e.target.id) openDetails[e.target.id]=e.target.open },true);
+let view={screen:"home", seriesId:null, raceId:null, tab:null};
+let ownTaps=[], ownRemoved=new Set(), ownDirty=false, ownFlushing=false;
+let timingKey="", stripKey="", dnfMode=false, armed=null, armTimer=null;
+const pendingRace={};              // raceId -> fields not yet written
+const qs={};                       // per-path write queues
+
+const deviceId=(()=>{let id=null;try{id=localStorage.getItem("lb-device")}catch(e){}
+  if(!id){id="d"+Math.random().toString(36).slice(2,9);try{localStorage.setItem("lb-device",id)}catch(e){}}return id})();
+let myFilter=(()=>{try{return localStorage.getItem("lb-filter")||"all"}catch(e){return "all"}})();
+
+/* ---------- helpers ---------- */
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const uid=()=>Math.random().toString(36).slice(2,10);
+function fmt(ms){ if(ms==null||isNaN(ms))return "–"; const neg=ms<0; ms=Math.abs(Math.round(ms/1000));
+  const h=Math.floor(ms/3600), m=Math.floor(ms%3600/60), s=ms%60;
+  return (neg?"−":"")+(h?h+":"+String(m).padStart(2,"0"):m)+":"+String(s).padStart(2,"0"); }
+const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
+const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+function toast(msg){const t=$("#toast");t.textContent=msg;t.hidden=false;clearTimeout(toast.t);toast.t=setTimeout(()=>t.hidden=true,1800)}
+function buzz(){try{navigator.vibrate&&navigator.vibrate(25)}catch(e){}}
+function enqueue(path,fn){qs[path]=(qs[path]||Promise.resolve()).then(fn).catch(e=>{console.error(e);
+  if(e&&e.code==="permission-denied")toast(mode==="tk"?"This timekeeper link no longer works. Ask the organiser for a new one":"You don't have permission to change this");
+  else toast("Couldn't save. Check your signal and try again")});return qs[path]}
+const keyFor=rid=>mode==="tk"?(view.raceId===rid?tkKey:null):keys[rid]||null;
+const livePath=rid=>`races/${rid}/live/${keyFor(rid)}`;
+function getRace(id){const r=races[id];return r?{...r,...(lives[id]||{}),...(pendingRace[id]||{}),id}:null}
+function setRace(id,fields){pendingRace[id]={...(pendingRace[id]||{}),...fields};
+  enqueue("races/"+id,async()=>{const f=pendingRace[id];if(!f)return;delete pendingRace[id];
+    const live={},rest={}; for(const k in f)(LIVE_FIELDS.has(k)?live:rest)[k]=f[k];
+    if(Object.keys(live).length){ if(!keyFor(id))throw new Error("no key for race"); await db.doc(livePath(id)).update(live) }
+    if(Object.keys(rest).length) await db.doc("races/"+id).update(rest);
+  });render()}
+function seriesName(s){return s?s.name:"Series"}
+function ridersOf(s){return Object.entries((s&&s.riders)||{}).map(([id,r])=>({id,...r})).sort((a,b)=>a.num-b.num)}
+function arm(key,fn){ if(armed===key){armed=null;clearTimeout(armTimer);fn();return;}
+  armed=key;clearTimeout(armTimer);armTimer=setTimeout(()=>{armed=null;render()},3500);render(); }
+const armLabel=(key,label,armedLabel)=>armed===key?armedLabel:label;
+
+/* ---------- race maths ---------- */
+function allTapsFor(race){
+  const out=[]; const removed=new Set(((race.edits||{}).removed)||[]);
+  for(const [docId,d] of Object.entries(tapDocs)){
+    const list = docId===deviceId ? ownTaps : (d.taps||[]);
+    for(const t of list) if(!removed.has(t.id)) out.push(t);
+  }
+  if(tapDocs[deviceId]===undefined) for(const t of ownTaps) if(!removed.has(t.id)) out.push(t);
+  for(const t of ((race.edits||{}).added||[])) if(!removed.has(t.id)) out.push({...t,added:true});
+  return out;
+}
+function compute(race, s, now){
+  const start=race.startAt, riders=(s&&s.riders)||{};
+  const ids=new Set(race.checkedIn||[]);
+  const taps=start?allTapsFor(race):[];
+  for(const t of taps) if(riders[t.r]) ids.add(t.r);
+  const by={}; ids.forEach(id=>{ if(riders[id]) by[id]=[] });
+  for(const t of taps){ if(t.t<start||!by[t.r])continue; by[t.r].push(t) }
+  const R={};
+  for(const id in by){
+    const list=by[id].sort((a,b)=>a.t-b.t), cr=[], dupes=[];
+    for(const t of list){ if(cr.length&&t.t-cr[cr.length-1].t<DEDUP_MS) dupes.push(t); else cr.push(t) }
+    R[id]={id, rider:riders[id], all:cr, dupes};
+  }
+  let finishAt=null;
+  if(race.targetLaps){ for(const id in R){const c=R[id].all; if(c.length>=race.targetLaps){const t=c[race.targetLaps-1].t; if(finishAt==null||t<finishAt)finishAt=t}} }
+  const firstLaps=[];
+  for(const id in R){
+    const x=R[id]; let counted=x.all, fin=false, finishT=null;
+    if(finishAt!=null){const i=x.all.findIndex(c=>c.t>=finishAt); if(i>=0){counted=x.all.slice(0,i+1);fin=true;finishT=x.all[i].t}}
+    x.cr=counted; x.laps=counted.length; x.fin=fin; x.finishT=finishT;
+    x.lapTimes=counted.map((c,i)=>c.t-(i?counted[i-1].t:start));
+    x.last=x.laps?counted[x.laps-1].t:start;
+    x.dnf=(race.dnf||[]).includes(id);
+    if(x.laps) firstLaps.push(x.lapTimes[0]);
+  }
+  const fl=median(firstLaps);
+  for(const id in R){ const x=R[id];
+    x.avg = x.laps>=2 ? median(x.lapTimes.slice(1)) : x.laps===1 ? x.lapTimes[0]*0.95 : fl;
+    x.expected = x.avg!=null ? x.last + x.avg : null;
+    x.overdue = !x.fin && !x.dnf && x.avg!=null && now - x.last > x.avg*1.4 && x.laps>0;
+  }
+  let leader=null;
+  for(const id in R){const x=R[id]; if(!x.laps)continue; if(!leader||x.laps>leader.laps||(x.laps===leader.laps&&x.last<leader.last))leader=x}
+  // Lap count: worked out once from the leader's 2nd lap (the start sprint skews lap 1), then locked in race.targetLaps
+  let pred=null;
+  const D=(race.durationMin||45)*60000;
+  if(leader&&start&&leader.laps>=2){
+    const lt=leader.lapTimes, lap2=lt[1], e2=leader.cr[1].t-start;
+    let best=null;
+    for(let N=2;N<=80;N++){const proj=e2+(N-2)*lap2; if(!best||Math.abs(proj-D)<Math.abs(best.proj-D))best={N,proj}}
+    const recent=lt.length>=2?mean(lt.slice(Math.max(1,lt.length-3))):lt[0];
+    pred={lap2, N:Math.max(best.N,leader.laps+1), recent};
+  }
+  return {R, leader, finishAt, pred, start};
+}
+function flagsFor(x){
+  const out=[]; const lt=x.lapTimes; if(lt.length<3)return out;
+  const med=median(lt.slice(1));
+  lt.forEach((v,i)=>{ const ref=i===0?med*1.1:med;
+    if(v>ref*1.65) out.push({type:"missed",lap:i,at:(i?x.cr[i-1].t:null),insertT:Math.round((i?x.cr[i-1].t:x.cr[0].t-v)+v/2)});
+    else if(i>0&&v<med*0.5) out.push({type:"short",lap:i,tapId:x.cr[i].id});
+  });
+  return out;
+}
+function rankings(race,s,now){
+  const c=compute(race,s,now); const done=race.status==="done"||race.status==="published";
+  const out={};
+  for(const cat of Object.keys(CATS)){
+    const xs=Object.values(c.R).filter(x=>x.rider.cat===cat);
+    const fin=xs.filter(x=>x.fin&&!x.dnf).sort((a,b)=>b.laps-a.laps||a.finishT-b.finishT);
+    const run=xs.filter(x=>!x.fin&&!x.dnf&&x.laps>0).sort((a,b)=>b.laps-a.laps||a.last-b.last);
+    const dnf=xs.filter(x=>x.dnf).sort((a,b)=>b.laps-a.laps||a.last-b.last);
+    const dns=xs.filter(x=>!x.dnf&&!x.fin&&x.laps===0).sort((a,b)=>a.rider.num-b.rider.num);
+    const win=fin[0]||run[0];
+    const rows=[]; let pos=0;
+    for(const x of [...fin,...run]){ pos++;
+      const behind=win?win.laps-x.laps:0; const t=(x.fin?x.finishT:x.last)-c.start;
+      const gap=!win||x===win?"":behind?`−${behind} lap${behind>1?"s":""}`:"+"+fmt(t-((win.fin?win.finishT:win.last)-c.start));
+      rows.push({x,pos:String(pos),status:x.fin?"fin":(done?"nofin":"run"),laps:x.laps,behind,time:t,gap});
+    }
+    for(const x of dnf) rows.push({x,pos:"DNF",status:"dnf",laps:x.laps,behind:null,time:null,gap:""});
+    for(const x of dns) rows.push({x,pos:"DNS",status:"dns",laps:0,behind:null,time:null,gap:""});
+    out[cat]=rows;
+  }
+  return {c,out};
+}
+
+/* ---------- own tap writes ---------- */
+function flushOwn(){ ownDirty=true; if(ownFlushing||!view.raceId)return; const rid=view.raceId;
+  ownFlushing=true;
+  (async()=>{ try{ while(ownDirty){ ownDirty=false;
+      await db.doc(livePath(rid)+"/taps/"+deviceId).set({device:deviceId, taps:ownTaps}); } }
+    catch(e){ console.error(e); toast("Tap not saved yet. Retrying…"); setTimeout(()=>{ownFlushing=false;flushOwn()},3000); return; }
+    ownFlushing=false; })();
+}
+function tap(riderId){
+  const race=getRace(view.raceId), s=series[race.seriesId];
+  if(dnfMode){ toggleDnf(riderId); dnfMode=false; render(); return; }
+  const t={id:deviceId+"-"+uid(), r:riderId, t:Date.now()};
+  ownTaps=[...ownTaps,t]; flushOwn(); buzz();
+  const c=compute(race,s,Date.now()), x=c.R[riderId];
+  const r=s.riders[riderId];
+  toast(x&&x.dupes.some(d=>d.id===t.id)?`#${r.num} already counted`:x&&x.fin&&x.finishT===t.t?`#${r.num} finished`:`#${r.num} lap ${x?x.laps:"?"}`);
+  const b=document.querySelectorAll(`[data-tap="${riderId}"]`); b.forEach(el=>{el.classList.add("flash");setTimeout(()=>el.classList.remove("flash"),180)});
+  liveUpdate();
+}
+function undoTap(id){ ownTaps=ownTaps.filter(t=>t.id!==id); ownRemoved.add(id); flushOwn(); liveUpdate(); toast("Tap removed") }
+function toggleDnf(id){ const race=getRace(view.raceId); const d=new Set(race.dnf||[]); d.has(id)?d.delete(id):d.add(id);
+  setRace(race.id,{dnf:[...d]}); const r=series[race.seriesId].riders[id]; toast(`#${r.num} ${d.has(id)?"marked DNF":"back in the race"}`) }
+
+/* ---------- subscriptions ---------- */
+function subTaps(raceId){
+  if(tapsRaceId===raceId)return;
+  if(tapsUnsub)tapsUnsub(); tapDocs={}; ownTaps=[]; ownRemoved=new Set(); tapsRaceId=raceId;
+  if(!keyFor(raceId)){ tapsRaceId=null; return }
+  tapsUnsub=db.collection(livePath(raceId)+"/taps").onSnapshot(snap=>{
+    const next={};
+    snap.docs.forEach(d=>{ next[d.id]=d.data() });
+    const mine=next[deviceId];
+    if(mine){ const have=new Set(ownTaps.map(t=>t.id)); const add=(mine.taps||[]).filter(t=>!have.has(t.id)&&!ownRemoved.has(t.id));
+      if(add.length) ownTaps=[...ownTaps,...add].sort((a,b)=>a.t-b.t); }
+    tapDocs=next; onData();
+  },e=>console.error(e));
+}
+function onData(){ if(view.screen==="race"&&view.tab==="timing"&&$("#grid")){ if(timingRenderKey()!==timingKey)render(); else liveUpdate(); } else render(); }
+
+/* ---------- navigation ---------- */
+const admin=()=>mode==="admin"&&isAdmin===true;
+function go(v){ view={...view,...v}; armed=null; dnfMode=false;
+  if(mode==="public"){ const h=view.screen==="race"?"#/r/"+view.raceId:view.screen==="series"?"#/s/"+view.seriesId:"#/";
+    if(location.hash!==h) history.replaceState(null,"",h); }
+  if(view.screen==="race"&&view.raceId){ subLive(view.raceId); subTaps(view.raceId); }
+  window.scrollTo(0,0); render(); }
+
+/* ---------- render ---------- */
+function header(crumbs,title,right,tabs){
+  return `<div class="top"><div class="crumbs">${crumbs.map(c=>c.go?`<button data-go='${esc(JSON.stringify(c.go))}'>${esc(c.label)}</button>`:`<span>${esc(c.label)}</span>`).join("<span>/</span>")}</div>
+  <div class="titlerow"><h1>${esc(title)}</h1>${right||""}</div>
+  ${tabs?`<div class="tabs" role="tablist">${tabs.map(t=>`<button data-tab="${t.id}" aria-current="${view.tab===t.id}">${t.label}</button>`).join("")}</div>`:""}</div>`;
+}
+function render(){
+  const app=$("#app");
+  if(!db){ app.innerHTML=`<div class="stack"><h1>Lapboard</h1><div class="card"><p>Lapboard isn't connected to its database yet. Add the Firebase settings to <code>config.js</code>.</p></div></div>`;return }
+  if(mode==="admin"&&isAdmin!==true){ app.innerHTML=renderSignIn(); return }
+  if(mode==="tk"&&(!races[view.raceId]||lives[view.raceId]===null||!lives[view.raceId]||!series[races[view.raceId].seriesId])){ app.innerHTML=`<div class="signin card"><h1>Timekeeper link</h1><p>${lives[view.raceId]===null||(loaded&&!races[view.raceId])?"This link isn't valid any more. Ask the organiser to send you a new one.":"Loading the race…"}</p></div>`; return }
+  if(!loaded||!seriesLoaded){ app.innerHTML=`<div class="empty" style="margin-top:40vh">Loading…</div>`; return }
+  if(view.screen==="series"&&(!series[view.seriesId]||(series[view.seriesId].archived&&!admin()))) view.screen="home";
+  if(view.screen==="race"&&races[view.raceId]&&races[view.raceId].archived&&mode==="public") view.screen="home";
+  if(view.screen==="race"&&!races[view.raceId]) view.screen=view.seriesId&&series[view.seriesId]?"series":"home";
+  timingKey="";
+  if(view.screen==="home") app.innerHTML=renderHome();
+  else if(view.screen==="orgs") app.innerHTML=admin()?renderOrgs():renderHome();
+  else if(view.screen==="series") app.innerHTML=renderSeries();
+  else app.innerHTML=renderRace();
+  app.insertAdjacentHTML("beforeend",footer());
+  if(view.screen==="race"&&view.tab==="timing") { timingKey=timingRenderKey(); stripKey=""; liveUpdate(); }
+}
+function renderHome(){
+  const list=Object.entries(series).filter(([,s])=>!s.archived).sort((a,b)=>(b[1].createdAt||0)-(a[1].createdAt||0));
+  return header([{label:admin()?"Lapboard · organiser":"Lapboard"}],admin()?"Your series":"Race results",admin()?`<button class="btn sm" data-go='${esc(JSON.stringify({screen:"orgs"}))}'>Organisers</button>`:null)+`<div class="stack">
+  ${list.length?`<div class="card list">${list.map(([id,s])=>{const n=Object.keys(s.riders||{}).length, rc=Object.values(races).filter(r=>r.seriesId===id&&!r.archived&&(admin()||r.published)).length;
+    return `<div class="item"><button class="link grow" data-go='${esc(JSON.stringify({screen:"series",seriesId:id,tab:"races"}))}'>
+      <div style="font-family:var(--display);font-size:21px;font-weight:700">${esc(s.name)}</div>
+      <div class="small muted">${s.kind==="oneday"?"One-day race":"Series"} · ${n} riders · ${rc} race${rc===1?"":"s"}</div></button>
+      <span class="muted" aria-hidden="true">›</span></div>`}).join("")}</div>`
+    :`<div class="card empty">${admin()?"No series yet. Create one below, for example “Biscuit Cup 2026”.":"No results yet."}</div>`}
+  ${admin()?`<form class="card" id="newSeries"><h2>New series or one-day race</h2>
+    <div class="row" style="margin-top:10px;align-items:flex-end">
+      <label class="f">Name<input type="text" id="ns-name" required placeholder="Die Goldene Ananas 2026"></label>
+      <label class="f" style="flex:0 1 170px">Type<select id="ns-kind"><option value="series">Series (several races)</option><option value="oneday">One-day race</option></select></label>
+      <button class="btn primary" type="submit">Create</button></div></form>`:""}
+  ${admin()?renderArchive():""}
+  </div>`;
+}
+function renderArchive(){
+  const as=Object.entries(series).filter(([,s])=>s.archived);
+  const ar=Object.entries(races).filter(([,r])=>r.archived&&series[r.seriesId]&&!series[r.seriesId].archived);
+  if(!as.length&&!ar.length) return "";
+  const row=(label,sub,restore,del,delKey)=>`<div class="item"><div class="grow"><div style="font-weight:600">${esc(label)}</div><div class="small muted">${esc(sub)}</div></div>
+    <button class="btn sm" ${restore}>Restore</button><button class="btn sm ${armed===delKey?"arm":"danger"}" ${del}>${armLabel(delKey,"Delete forever","Tap again")}</button></div>`;
+  return `<details class="card" id="d-archive" ${openDetails["d-archive"]?"open":""}><summary style="cursor:pointer"><h3 style="display:inline">Archive (${as.length+ar.length})</h3></summary><div class="list" style="margin-top:8px">
+    ${as.map(([id,s])=>row(s.name,`Series · ${Object.values(races).filter(r=>r.seriesId===id).length} races`,`data-restoreseries="${id}"`,`data-delseries="${id}"`,"delseries-"+id)).join("")}
+    ${ar.map(([rid,r])=>row(r.name,`${series[r.seriesId].name} · ${r.date||""}`,`data-restorerace="${rid}"`,`data-delrace="${rid}"`,"delrace-"+rid)).join("")}
+  </div></details>`;
+}
+function renderOrgs(){
+  const me=(authUser&&authUser.email||"").toLowerCase(), owner=ownerEmails.includes(me);
+  const list=(organisers.emails||[]);
+  return header([{label:"Lapboard",go:{screen:"home"}}],"Organisers",null)+`<div class="stack">
+  <div class="card"><p class="note" style="margin-bottom:8px">Organisers sign in with their Google account and can manage series, riders, races and results.</p>
+  <div class="list">${ownerEmails.map(e=>`<div class="item"><div class="grow">${esc(e)}</div><span class="pill">Owner</span></div>`).join("")}
+  ${list.map(e=>`<div class="item"><div class="grow">${esc(e)}</div>${owner?`<button class="btn sm ${armed==="rmorg-"+e?"arm":"ghost"}" data-rmorg="${esc(e)}">${armLabel("rmorg-"+e,"Remove","Confirm")}</button>`:""}</div>`).join("")}</div></div>
+  ${owner?`<form class="card" id="addOrg"><h2>Add an organiser</h2><div class="row" style="margin-top:10px;align-items:flex-end">
+    <label class="f">Their Google account email<input type="email" id="org-email" required autocomplete="off" placeholder="friend@gmail.com"></label>
+    <button class="btn primary" type="submit">Add</button></div><p class="note" style="margin-top:8px">They can sign in straight away at the organiser page: ${esc(location.origin+location.pathname)}#/admin</p></form>`
+    :`<p class="note">Only the owner can add or remove organisers.</p>`}
+  </div>`;
+}
+function renderSeries(){
+  const s=series[view.seriesId], id=view.seriesId;
+  const tabs=[{id:"races",label:"Races"},{id:"riders",label:"Riders"},{id:"standings",label:s.kind==="oneday"?"Results":"Standings"}];
+  if(admin()) tabs.push({id:"settings",label:"Settings"});
+  if(!tabs.some(t=>t.id===view.tab)) view.tab="races";
+  let body="";
+  const rl=Object.entries(races).filter(([,r])=>r.seriesId===id&&!r.archived&&(admin()||r.published)).sort((a,b)=>String(a[1].date).localeCompare(String(b[1].date)));
+  if(view.tab==="races"){
+    body=`${rl.length?`<div class="card list">${rl.map(([rid,r])=>{r=getRace(rid);
+      const st=!admin()?"":r.status==="running"?`<span class="pill live">Racing</span>`:r.status==="done"?`<span class="pill warn">To review</span>`:r.status==="published"?`<span class="pill ok">Published</span>`:`<span class="pill">Not started</span>`;
+      return `<div class="item"><button class="link grow" data-go='${esc(JSON.stringify({screen:"race",raceId:rid,tab:r.status==="published"||!admin()?"results":r.status==="done"?"review":r.status==="running"?"timing":"checkin"}))}'>
+        <div style="font-weight:600">${esc(r.name)}</div><div class="small muted">${esc(r.date||"")}${admin()?` · ${r.durationMin||45} min · ${(r.checkedIn||[]).length} checked in`:""}</div></button>${st}</div>`}).join("")}</div>`
+      :`<div class="card empty">${admin()?"No races yet.":"No published results yet."}</div>`}
+    ${admin()?`<form class="card" id="newRace"><h2>Add a race</h2><div class="row" style="margin-top:10px;align-items:flex-end">
+      <label class="f">Name<input type="text" id="nr-name" required value="Round ${rl.length+1}"></label>
+      <label class="f" style="flex:0 1 150px">Date<input type="date" id="nr-date" value="${new Date().toISOString().slice(0,10)}"></label>
+      <label class="f" style="flex:0 1 100px">Minutes<input type="number" id="nr-min" min="5" max="180" value="45"></label>
+      <button class="btn primary" type="submit">Add race</button></div></form>`:""}`;
+  } else if(view.tab==="riders"){
+    const rs=ridersOf(s);
+    body=`${admin()?riderForm("addRider","Register a rider",s):""}
+    <div class="card"><div class="spread"><h3>${rs.length} registered</h3><span class="small muted">${rs.filter(r=>r.cat==="M").length} men · ${rs.filter(r=>r.cat==="F").length} women</span></div>
+    <div class="list" style="margin-top:6px">${rs.map(r=>`<div class="item"><span class="plate-sm">${r.num}</span><div class="grow">${esc(r.name)}</div><span class="pill">${CATS[r.cat]||r.cat}</span>
+      ${admin()?`<button class="btn sm ${armed==="del-"+r.id?"arm":"ghost"}" data-delrider="${r.id}">${armLabel("del-"+r.id,"Remove","Confirm")}</button>`:""}</div>`).join("")||`<div class="empty">No riders yet.</div>`}</div></div>`;
+  } else if(view.tab==="standings"){
+    body=renderStandings(s,id,rl.map(([rid])=>getRace(rid)));
+  } else {
+    body=`<form class="card" id="seriesSettings"><h2>Settings</h2><div class="stack" style="margin-top:8px">
+      <label class="f">Name<input type="text" id="ss-name" value="${esc(s.name)}"></label>
+      <label class="f">Points for 1st, 2nd, 3rd… (comma separated, per category)<input type="text" id="ss-points" value="${esc((s.points||DEFAULT_POINTS).join(", "))}"></label>
+      <p class="note">Positions beyond the list score 0. DNF and DNS score 0. This is a placeholder table until the series scoring is decided.</p>
+      <div><button class="btn primary" type="submit">Save settings</button></div></div></form>
+    <div class="card"><h2>Archive</h2><p class="note" style="margin:6px 0 10px">Archived races and series disappear from the lists and public pages. You can restore them from the Archive on the home screen.</p>
+      <div class="list">${rl.map(([rid])=>{const r=getRace(rid);return `<div class="item"><div class="grow">${esc(r.name)} <span class="small muted">${esc(r.date||"")}</span></div>
+        <button class="btn sm" data-archrace="${rid}">Archive race</button></div>`}).join("")||`<div class="small muted">No races in this series.</div>`}</div>
+      <div class="row" style="margin-top:14px"><button class="btn danger" data-archseries="${id}">Archive the whole series</button></div></div>`;
+  }
+  return header([{label:"Lapboard",go:{screen:"home"}}],s.name,null,tabs)+`<div class="stack">${body}</div>`;
+}
+function riderForm(fid,title,s){
+  const used=new Set(Object.values(s.riders||{}).map(r=>r.num)); let n=1; while(used.has(n))n++;
+  return `<form class="card" id="${fid}"><h2>${title}</h2><div class="row" style="margin-top:10px;align-items:flex-end">
+    <label class="f">Name<input type="text" id="${fid}-name" required autocomplete="off"></label>
+    <label class="f" style="flex:0 1 90px">Number<input type="number" id="${fid}-num" min="1" value="${n}"></label>
+    <label class="f" style="flex:0 1 110px">Category<select id="${fid}-cat"><option value="M">Men</option><option value="F">Women</option></select></label>
+    <button class="btn primary" type="submit">Add</button></div></form>`;
+}
+function renderStandings(s,sid,rl){
+  const pub=rl.filter(r=>r.published);
+  if(!pub.length) return `<div class="card empty">Standings appear here once a race result is published.</div>`;
+  const pts=s.points||DEFAULT_POINTS;
+  return Object.entries(CATS).map(([cat,label])=>{
+    const tot={};
+    pub.forEach((r,ri)=>{ (r.published.rows[cat]||[]).forEach(row=>{ const p=/^\d+$/.test(row.pos)?(pts[+row.pos-1]||0):0;
+      const t=tot[row.rid]||(tot[row.rid]={rid:row.rid,name:row.name,num:row.num,total:0,per:{}}); t.total+=p; t.per[ri]=p; }) });
+    const rows=Object.values(tot).sort((a,b)=>b.total-a.total||a.num-b.num);
+    if(!rows.length) return "";
+    let last=null,pos=0; rows.forEach((r,i)=>{ if(r.total!==last){pos=i+1;last=r.total} r.pos=pos });
+    return `<div class="card"><h2>${label}</h2><div class="tbl-wrap"><table><thead><tr><th>Pos</th><th>Rider</th>${pub.map((r,i)=>`<th class="r" title="${esc(r.name)}">R${i+1}</th>`).join("")}<th class="r">Pts</th></tr></thead><tbody>
+    ${rows.map(r=>`<tr><td class="pos">${r.pos}</td><td><span class="plate-sm">${r.num}</span> ${esc(r.name)}</td>${pub.map((_,i)=>`<td class="r t">${r.per[i]??"–"}</td>`).join("")}<td class="r t" style="font-weight:700">${r.total}</td></tr>`).join("")}
+    </tbody></table></div></div>`;
+  }).join("") + `<p class="note">${pub.length} published race${pub.length>1?"s":""}: ${pub.map((r,i)=>`R${i+1} ${esc(r.name)}`).join(" · ")}</p>`;
+}
+function renderRace(){
+  const race=getRace(view.raceId), s=series[race.seriesId];
+  const tabs=admin()?[{id:"checkin",label:"Check-in"},{id:"timing",label:"Timing"},{id:"review",label:"Review"},{id:"results",label:"Results"}]
+    :mode==="tk"?[{id:"checkin",label:"Check-in"},{id:"timing",label:"Timing"}]:[{id:"results",label:"Results"}];
+  if(!tabs.some(t=>t.id===view.tab)) view.tab=tabs[0].id;
+  const crumbs=mode==="tk"?[{label:"Timekeeper"},{label:s.name}]:[{label:"Lapboard",go:{screen:"home"}},{label:s.name,go:{screen:"series",seriesId:race.seriesId,tab:"races"}}];
+  let body="";
+  if(view.tab==="checkin") body=renderCheckin(race,s);
+  else if(view.tab==="timing") body=renderTiming(race,s);
+  else if(view.tab==="review") body=renderReview(race,s);
+  else body=renderResults(race,s);
+  return header(crumbs,race.name,`<span class="small muted">${esc(race.date||"")}${mode==="public"?"":` · ${race.durationMin||45} min`}</span>`,tabs)+body;
+}
+function tkUrl(race){ return location.origin+location.pathname+"#/t/"+race.id+"/"+keyFor(race.id) }
+function tkLinkCard(race){
+  if(!keyFor(race.id)) return "";
+  return `<div class="card"><div class="spread"><h2>Timekeeper link</h2><span class="small muted">No account needed</span></div>
+  <p class="note" style="margin:6px 0 10px">Anyone with this link can check riders in and record laps for this race only. Send it to your helpers by text or WhatsApp.</p>
+  <div class="linkbox"><code>${esc(tkUrl(race))}</code><button class="btn sm primary" data-act="sharelink">Share</button><button class="btn sm" data-act="copylink">Copy</button></div>
+  <div class="row" style="margin-top:8px"><button class="btn sm ${armed==="rekey"?"arm":"ghost"}" data-act="rekey">${armLabel("rekey","Make a new link (old one stops working)","Tap again to replace the link")}</button></div></div>`;
+}
+function renderSignIn(){
+  if(isAdmin===false&&authUser) return `<div class="signin card stack"><h1>Not an organiser account</h1><p>${esc(authUser.email)} can't manage races. Sign in with an organiser's Google account, or ask an organiser to add you.</p>
+    <div class="row" style="justify-content:center"><button class="btn" data-act="signout">Sign out</button><a class="btn ghost" href="#/">Public results</a></div></div>`;
+  if(authUser) return `<div class="signin"><p class="muted">Checking your account…</p></div>`;
+  return `<div class="signin card stack"><h1>Lapboard organiser</h1><p>Sign in to set up series, register riders, run races and publish results.</p>
+    <div class="row" style="justify-content:center"><button class="btn primary" data-act="signin">Sign in with Google</button></div>
+    <p class="note"><a href="#/">See public results</a></p></div>`;
+}
+function footer(){
+  if(mode==="tk") return `<div class="foot"><span>Lapboard timekeeper · this phone records as ${esc(deviceId)}</span></div>`;
+  if(mode==="admin") return `<div class="foot"><span>Signed in as ${esc(authUser&&authUser.email)}</span><button class="btn sm ghost" data-act="signout">Sign out</button><a href="#/">Public view</a></div>`;
+  return `<div class="foot"><a href="#/admin">Organiser sign-in</a></div>`;
+}
+function renderCheckin(race,s){
+  const rs=ridersOf(s), inn=new Set(race.checkedIn||[]);
+  const q=(view.q||"").toLowerCase();
+  const shown=rs.filter(r=>!q||r.name.toLowerCase().includes(q)||String(r.num)===q);
+  return `<div class="stack">
+  ${admin()?tkLinkCard(race):""}
+  <div class="spread"><div><b class="num" style="font-family:var(--display);font-size:26px">${inn.size}</b> <span class="muted">of ${rs.length} checked in · ${rs.filter(r=>inn.has(r.id)&&r.cat==="M").length} men, ${rs.filter(r=>inn.has(r.id)&&r.cat==="F").length} women</span></div>
+  <div class="row"><button class="btn sm" data-act="checkall">Check in everyone</button><button class="btn sm ghost" data-act="checknone">Clear</button></div></div>
+  <input type="text" id="ci-search" placeholder="Search name or number" value="${esc(view.q||"")}" autocomplete="off">
+  <div class="card list">${shown.map(r=>`<label class="item" style="cursor:pointer"><input type="checkbox" data-check="${r.id}" ${inn.has(r.id)?"checked":""} style="width:22px;height:22px"><span class="plate-sm">${r.num}</span><span class="grow">${esc(r.name)}</span><span class="pill">${CATS[r.cat]}</span></label>`).join("")||`<div class="empty">No riders match.</div>`}</div>
+  ${admin()?`${riderForm("newAtCheckin","New rider today",s)}
+  <p class="note">New riders are added to the series with their number and checked in to this race.</p>`:`<p class="note">Someone missing from the list? The organiser can register new riders and they'll appear here straight away.</p>`}
+  ${race.status==="setup"||!race.status?`<div><button class="btn dark" data-go='${esc(JSON.stringify({tab:"timing"}))}'>Go to timing</button></div>`:""}
+  </div>`;
+}
+function filterRiders(list){
+  if(myFilter==="M"||myFilter==="F") return list.filter(r=>r.cat===myFilter);
+  if(myFilter==="odd") return list.filter(r=>r.num%2===1);
+  if(myFilter==="even") return list.filter(r=>r.num%2===0);
+  return list;
+}
+function timingRenderKey(){ const race=getRace(view.raceId); if(!race)return ""; return [race.status,!!race.startAt,(race.checkedIn||[]).join(","),myFilter,dnfMode,armed].join("|") }
+function renderTiming(race,s){
+  const inn=new Set(race.checkedIn||[]);
+  const rs=filterRiders(ridersOf(s).filter(r=>inn.has(r.id)));
+  const started=!!race.startAt;
+  const ended=race.status==="done"||race.status==="published";
+  return `<div class="stack" style="gap:12px">
+  <div class="clockbar"><div><div class="tag">Race time</div><div class="clock" id="clock">${started?"0:00":"–:––"}<small>/ ${race.durationMin||45}:00</small></div></div>
+    <div class="row" style="justify-content:flex-end">
+      ${!started?`<button class="btn ${armed==="start"?"arm":"primary"}" data-act="start" ${inn.size?"":"disabled"}>${armLabel("start","Start race","Tap again to start")}</button>`:""}
+      ${started&&!ended?`<button class="btn sm ${armed==="end"?"arm":""}" data-act="end">${armLabel("end","End race","Tap again to end")}</button>`:""}
+    </div></div>
+  ${!inn.size?`<div class="card empty">Check riders in first. Only checked-in riders appear here.</div>`:""}
+  <div id="banner"></div>
+  <div><div class="spread" style="margin-bottom:6px"><span class="tag">Coming up</span><span class="small muted" id="leaderline"></span></div><div class="strip" id="strip"></div></div>
+  <div class="spread"><div class="seg" role="group" aria-label="Riders on this phone">
+    ${[["all","All"],["M","Men"],["F","Women"],["odd","Odd #"],["even","Even #"]].map(([k,l])=>`<button data-filter="${k}" aria-pressed="${myFilter===k}">${l}</button>`).join("")}</div>
+    ${started&&!ended?`<button class="btn sm ${dnfMode?"arm":"danger"}" data-act="dnfmode">${dnfMode?"Tap the rider who stopped":"Mark DNF"}</button>`:""}</div>
+  <div class="grid ${dnfMode?"dnfmode":""}" id="grid">${rs.map(r=>`<button class="plate" data-tap="${r.id}" ${started&&!ended?"":"disabled"} aria-label="Rider ${r.num} ${esc(r.name)}"><span class="cat">${r.cat}</span>${r.num}<span class="lp" data-lp="${r.id}"></span></button>`).join("")}</div>
+  <div><div class="tag" style="margin-bottom:6px">Your last taps</div><div class="recent" id="recent"></div></div>
+  ${started?`<details class="card" id="d-controls" ${openDetails["d-controls"]?"open":""}><summary class="small" style="cursor:pointer;font-weight:600">Race controls</summary><div class="stack" style="margin-top:10px">
+    <label class="f">Race length in minutes<input type="number" id="dur" min="5" max="180" value="${race.durationMin||45}"></label>
+    <div class="row"><button class="btn sm ${armed==="reset"?"arm":"danger"}" data-act="reset">${armLabel("reset","Reset race and delete all taps","Tap again to delete every tap")}</button></div>
+    <p class="note">Two phones can time together. Each picks a group above (for example Men and Women) so neither list is crowded. If both tap the same rider within ${DEDUP_MS/1000} seconds, it counts once.</p></div></details>`:
+    `<p class="note">Tip: with two timekeepers, each phone picks a group above. Taps from both phones go into the same race.</p>`}
+  </div>`;
+}
+function liveUpdate(){
+  if(view.screen!=="race"||view.tab!=="timing"||!$("#grid"))return;
+  const race=getRace(view.raceId), s=series[race.seriesId], now=Date.now();
+  const c=compute(race,s,now), started=!!race.startAt, ended=race.status==="done"||race.status==="published";
+  const el=started?now-race.startAt:0;
+  $("#clock").firstChild.nodeValue=started?fmt(ended&&c.finishAt?c.finishAt-race.startAt:el):"–:––";
+  // banner
+  let b="";
+  if(!started) b=`<div class="banner"><p>Press <b>Start race</b> as the riders go. Then tap each number as it crosses the line.</p></div>`;
+  else if(ended) b=admin()?`<div class="banner fin"><p>Race ended. Check the <b>Review</b> tab, then publish.</p><button class="btn sm dark" data-go='${esc(JSON.stringify({tab:"review"}))}'>Review</button></div>`
+    :`<div class="banner fin"><p><b>Race ended.</b> Thanks for timing. The organiser will check the laps and publish the results.</p></div>`;
+  else if(c.finishAt){ const xs=Object.values(c.R).filter(x=>!x.dnf&&x.laps>0), fin=xs.filter(x=>x.fin).length;
+    b=`<div class="banner fin"><p><b>Finishing.</b> ${fin} of ${xs.length} riders in. Every rider's next crossing is their finish.</p><button class="btn sm ${armed==="end"?"arm":"dark"}" data-act="end">${armLabel("end","End race","Tap again to end")}</button></div>`; }
+  else if(race.targetLaps&&c.leader){ const T=race.targetLaps, L=c.leader.laps, avg=c.pred?c.pred.recent:c.leader.avg;
+    if(L>=T-1) b=`<div class="banner hot"><p><b>Last lap. Ring the bell.</b> Leader #${c.leader.rider.num} finishes on lap ${T}, at about ${fmt(c.leader.last-race.startAt+avg)}.</p></div>`;
+    else b=`<div class="banner"><p>Race is <b>${T} laps</b>${race.lapsFrom?` (set from the leader's lap 2 of ${fmt(race.lapsFrom)})`:""}. Ring the bell when the leader completes lap ${T-1}, at about ${fmt(c.leader.last-race.startAt+(T-1-L)*avg)}.</p>
+      <div class="row"><button class="btn sm" data-act="lapsminus" ${T-1>L+1?"":"disabled"} aria-label="One lap fewer">−1 lap</button><button class="btn sm" data-act="lapsplus" aria-label="One lap more">+1 lap</button></div></div>`; }
+  else if(c.leader&&c.leader.laps>=1){ b=`<div class="banner"><p>The number of laps is set when the leader finishes lap 2. Leader's lap 1: ${fmt(c.leader.lapTimes[0])}.</p><button class="btn sm ${armed==="bellnow"?"arm":""}" data-act="bellnow">${armLabel("bellnow","Call last lap now","Tap again")}</button></div>`; }
+  else b=`<div class="banner"><p>The number of laps is set when the leader finishes lap 2.</p></div>`;
+  if(!ended&&!race.targetLaps&&c.pred&&!liveUpdate.locking){ liveUpdate.locking=true;
+    setRace(race.id,{targetLaps:c.pred.N,lapsFrom:Math.round(c.pred.lap2)}); setTimeout(()=>liveUpdate.locking=false,5000); toast(`Race set to ${c.pred.N} laps`); }
+  const bn=$("#banner"); if(bn.dataset.k!==b){bn.innerHTML=b;bn.dataset.k=b}
+  $("#leaderline").textContent=c.leader?`Leader #${c.leader.rider.num} · lap ${c.leader.laps}${race.targetLaps?" of "+race.targetLaps:""}`:"";
+  // plates
+  const inView=new Set();
+  document.querySelectorAll("#grid .plate").forEach(btn=>{ const id=btn.dataset.tap, x=c.R[id]; inView.add(id); if(!x)return;
+    const due=started&&!ended&&!x.fin&&!x.dnf&&x.expected!=null&&x.expected-now<45000;
+    btn.classList.toggle("due",due&&!x.overdue); btn.classList.toggle("over",x.overdue&&!ended); btn.classList.toggle("fin",x.fin); btn.classList.toggle("dnf",x.dnf);
+    const lp=btn.querySelector(".lp"); lp.textContent=x.dnf?"DNF":x.fin?"✓ "+x.laps+" laps":x.overdue?"overdue":x.laps?"lap "+x.laps:"–";
+    if(!dnfMode) btn.disabled=!started||ended||x.fin||x.dnf; });
+  // strip: due riders, soonest first
+  const up=started&&!ended?Object.values(c.R).filter(x=>inView.has(x.id)&&!x.fin&&!x.dnf&&x.expected!=null&&x.expected-now<75000).sort((a,b)=>a.expected-b.expected).slice(0,8):[];
+  const k=up.map(x=>x.id+(x.overdue?"o":"")).join(",");
+  if(k!==stripKey){ stripKey=k; $("#strip").innerHTML=up.length?up.map(x=>`<button class="plate ${x.overdue?"over":"due"}" data-tap="${x.id}"><span class="cat">${x.rider.cat}</span>${x.rider.num}<span class="lp">${x.overdue?"overdue":"lap "+(x.laps+1)}</span></button>`).join("")
+      :`<span class="strip-empty">${started&&!ended?"Riders due in the next minute appear here.":"–"}</span>`; }
+  // recent own taps
+  const rec=[...ownTaps].sort((a,b)=>b.t-a.t).slice(0,6);
+  const rk=rec.map(t=>t.id).join(",");
+  const re=$("#recent"); if(re.dataset.k!==rk){ re.dataset.k=rk; re.innerHTML=rec.length?rec.map(t=>{const r=s.riders[t.r];return `<span class="tap">#${r?r.num:"?"} <span class="muted t">${started?fmt(t.t-race.startAt):""}</span><button data-undo="${t.id}">Undo</button></span>`}).join(""):`<span class="small muted">None yet</span>`; }
+}
+function renderReview(race,s){
+  if(!race.startAt) return `<div class="stack"><div class="card empty">Nothing to review until the race has started.</div></div>`;
+  const now=Date.now(), {c,out}=rankings(race,s,now), ended=race.status==="done"||race.status==="published";
+  let flags=0;
+  const sec=Object.entries(CATS).map(([cat,label])=>{ const rows=out[cat]; if(!rows.length)return "";
+    return `<div class="card"><h2>${label}</h2><div class="tbl-wrap"><table><thead><tr><th>Pos</th><th>Rider</th><th class="r">Laps</th><th class="r">Time</th><th class="r">Gap</th></tr></thead><tbody>
+    ${rows.map(row=>{ const x=row.x, fl=flagsFor(x); flags+=fl.length;
+      const possibleDnf=ended&&!x.fin&&!x.dnf&&x.laps>0;
+      if(possibleDnf)flags++;
+      const missedLaps=new Set(fl.filter(f=>f.type==="missed").map(f=>f.lap)), shortLaps=new Set(fl.filter(f=>f.type==="short").map(f=>f.lap));
+      return `<tr><td class="pos">${row.pos}</td><td><span class="plate-sm">${x.rider.num}</span> ${esc(x.rider.name)}
+        ${x.lapTimes.length?`<div class="laps">${x.lapTimes.map((v,i)=>`<span class="${missedLaps.has(i)?"flag":shortLaps.has(i)?"short":""}">L${i+1} ${fmt(v)}</span>`).join("")}</div>`:""}
+        ${fl.map(f=>f.type==="missed"?`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} looks like 2 laps</span><button class="btn sm" data-addtap="${x.id}|${f.insertT}">Add missed lap</button></div>`
+          :`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} is very short</span><button class="btn sm" data-rmtap="${f.tapId}">Remove that tap</button></div>`).join("")}
+        ${possibleDnf?`<div class="flagrow"><span class="pill warn">No finish recorded</span><button class="btn sm" data-dnf="${x.id}">Mark DNF</button><button class="btn sm ghost" data-addfinish="${x.id}">Add finish now</button></div>`:""}
+        ${x.dnf?`<div class="flagrow"><button class="btn sm ghost" data-dnf="${x.id}">Undo DNF</button></div>`:""}
+      </td><td class="r t">${row.status==="dnf"||row.status==="dns"?(row.laps||"–"):row.laps}</td><td class="r t">${row.time!=null?fmt(row.time):"–"}</td><td class="r t">${esc(row.gap)}</td></tr>`}).join("")}
+    </tbody></table></div></div>` }).join("");
+  const pub=race.published;
+  return `<div class="stack">
+    <div class="banner ${flags?"":"fin"}"><p>${!ended?"The race is still running. Results here update live.":flags?`<b>${flags} thing${flags>1?"s":""} to check</b> before publishing. Highlighted laps are about twice or half the rider's usual lap.`:"<b>No problems spotted.</b> Ready to publish."}</p>
+    ${ended?`<button class="btn sm primary" data-act="publish">${pub?"Republish results":"Publish results"}</button>`:""}</div>
+    ${pub?`<p class="note">Published ${new Date(pub.at).toLocaleString()}. Changes here go public only when you republish.</p>`:""}
+    ${sec}
+    ${ended?`<div class="row"><button class="btn sm ghost" data-act="reopen">Reopen timing</button></div>`:""}
+  </div>`;
+}
+function renderResults(race,s){
+  const pub=race.published;
+  if(!pub) return `<div class="stack"><div class="card empty">${admin()?"Results show here once you publish them from the Review tab.":"Results for this race haven't been published yet."}</div></div>`;
+  return `<div class="stack">${Object.entries(CATS).map(([cat,label])=>{ const rows=pub.rows[cat]||[]; if(!rows.length)return "";
+    const win=rows[0];
+    return `<div class="card"><div class="spread"><h2>${label}</h2>${win&&/^\d+$/.test(win.pos)?`<span class="small muted">Winner: ${win.laps} laps</span>`:""}</div><div class="tbl-wrap"><table><thead><tr><th>Pos</th><th>Rider</th><th class="r">Time</th><th class="r">Gap</th></tr></thead><tbody>
+    ${rows.map(r=>`<tr><td class="pos">${esc(r.pos)}</td><td><span class="plate-sm">${r.num}</span> ${esc(r.name)}</td><td class="r t">${r.time!=null?fmt(r.time):"–"}</td><td class="r t">${esc(r.gap)}</td></tr>`).join("")}
+    </tbody></table></div></div>`}).join("")}
+    <p class="note">Published ${new Date(pub.at).toLocaleDateString()} · ${race.durationMin||45} minute race</p></div>`;
+}
+
+/* ---------- races and keys ---------- */
+const newKey=()=>Array.from(crypto.getRandomValues(new Uint8Array(15)),b=>"abcdefghijkmnpqrstuvwxyz23456789"[b%32]).join("");
+async function createRace(fields){
+  const rr=db.collection("races").doc(), key=newKey(), rid=rr.id;
+  const {durationMin}=fields;
+  await rr.set({...fields,createdAt:Date.now(),edits:{added:[],removed:[]}});
+  await db.doc("raceKeys/"+rid).set({key});
+  keys[rid]=key;
+  const live={status:"setup",startAt:null,targetLaps:null,lapsFrom:null,checkedIn:[],dnf:[],durationMin};
+  await db.doc(`races/${rid}/live/${key}`).set(live);
+  races[rid]=races[rid]||{id:rid,...fields,edits:{added:[],removed:[]}}; lives[rid]=lives[rid]||live;
+  subLive(rid);
+  return rid;
+}
+async function rekey(rid){
+  const old=keys[rid], key=newKey();
+  try{
+    const live=await db.doc(`races/${rid}/live/${old}`).get();
+    await db.doc(`races/${rid}/live/${key}`).set(live.exists?live.data():{status:"setup",checkedIn:[],dnf:[]});
+    for(const [dev,d] of Object.entries(tapDocs)) await db.doc(`races/${rid}/live/${key}/taps/${dev}`).set(d);
+    await db.doc("raceKeys/"+rid).set({key});
+    for(const dev of Object.keys(tapDocs)) await db.doc(`races/${rid}/live/${old}/taps/${dev}`).delete();
+    await db.doc(`races/${rid}/live/${old}`).delete();
+    keys[rid]=key; if(liveUnsubs[rid]){liveUnsubs[rid]();delete liveUnsubs[rid]} subLive(rid);
+    tapsRaceId=null; subTaps(rid); toast("New link made. The old one no longer works");
+  }catch(e){ console.error(e); toast("Couldn't make a new link. Try again") }
+}
+async function deleteRace(rid){
+  const key=keys[rid];
+  if(liveUnsubs[rid]){ liveUnsubs[rid](); delete liveUnsubs[rid] }
+  if(key){ const taps=await db.collection(`races/${rid}/live/${key}/taps`).get();
+    for(const d of taps.docs) await db.doc(`races/${rid}/live/${key}/taps/${d.id}`).delete();
+    await db.doc(`races/${rid}/live/${key}`).delete(); await db.doc("raceKeys/"+rid).delete(); }
+  await db.doc("races/"+rid).delete();
+  delete races[rid]; delete lives[rid]; delete keys[rid];
+}
+function subLive(rid){
+  if(liveUnsubs[rid]||!keyFor(rid))return;
+  liveUnsubs[rid]=db.doc(livePath(rid)).onSnapshot(sn=>{ lives[rid]=sn.exists?sn.data():null; onData() },
+    e=>{ console.error(e); lives[rid]=null; render() });
+}
+
+/* ---------- actions ---------- */
+document.addEventListener("click",e=>{
+  const t=e.target.closest("button,[data-check]"); if(!t)return;
+  if(t.dataset.go){ go(JSON.parse(t.dataset.go)); return }
+  if(t.dataset.tab){ go({tab:t.dataset.tab}); return }
+  if(t.dataset.tap){ if(!t.disabled) tap(t.dataset.tap); return }
+  if(t.dataset.undo){ undoTap(t.dataset.undo); return }
+  if(t.dataset.filter){ myFilter=t.dataset.filter; try{localStorage.setItem("lb-filter",myFilter)}catch(e){} render(); return }
+  if(t.dataset.delrider){ const id=t.dataset.delrider; arm("del-"+id,()=>{ const s=series[view.seriesId]; const riders={...s.riders}; delete riders[id];
+      enqueue("series/"+view.seriesId,()=>db.doc("series/"+view.seriesId).set({...s,riders})); series[view.seriesId]={...s,riders}; render(); }); return }
+  if(t.dataset.dnf){ toggleDnf(t.dataset.dnf); return }
+  if(t.dataset.archrace||t.dataset.restorerace){ const rid=t.dataset.archrace||t.dataset.restorerace, a=!!t.dataset.archrace;
+    races[rid]={...races[rid],archived:a}; enqueue("races/"+rid,()=>db.doc("races/"+rid).update({archived:a})); toast(a?"Race moved to the archive":"Race restored"); render(); return }
+  if(t.dataset.archseries||t.dataset.restoreseries){ const sid=t.dataset.archseries||t.dataset.restoreseries, a=!!t.dataset.archseries;
+    series[sid]={...series[sid],archived:a}; enqueue("series/"+sid,()=>db.doc("series/"+sid).update({archived:a})); toast(a?"Series moved to the archive":"Series restored");
+    if(a) go({screen:"home",seriesId:null}); else render(); return }
+  if(t.dataset.delseries){ const sid=t.dataset.delseries; arm("delseries-"+sid,async()=>{ const name=series[sid].name;
+      try{ for(const rid of Object.keys(races).filter(r=>races[r].seriesId===sid)) await deleteRace(rid);
+        await db.doc("series/"+sid).delete(); delete series[sid]; toast(`${name} deleted for good`) }
+      catch(e){ console.error(e); toast("Couldn't delete everything. Try again") } render() }); return }
+  if(t.dataset.rmorg){ const e=t.dataset.rmorg; arm("rmorg-"+e,()=>{ const emails=(organisers.emails||[]).filter(x=>x!==e); organisers={emails};
+      enqueue("config/organisers",()=>db.doc("config/organisers").set({emails})); toast(e+" removed"); render() }); return }
+  if(t.dataset.delrace){ const rid=t.dataset.delrace; arm("delrace-"+rid,async()=>{ const n=races[rid]&&races[rid].name;
+      try{ await deleteRace(rid); toast(`${n} deleted for good`) }catch(e){ console.error(e); toast("Couldn't delete the race. Try again") } render() }); return }
+  if(t.dataset.addtap){ const [r,tt]=t.dataset.addtap.split("|"); const race=getRace(view.raceId); const ed=race.edits||{};
+    setRace(race.id,{edits:{removed:ed.removed||[],added:[...(ed.added||[]),{id:"e-"+uid(),r,t:+tt}]}}); toast("Lap added"); return }
+  if(t.dataset.addfinish){ const race=getRace(view.raceId), c=compute(race,series[race.seriesId],Date.now()), x=c.R[t.dataset.addfinish];
+    const at=Math.max(c.finishAt||0,x.last+DEDUP_MS)+1000; const ed=race.edits||{};
+    setRace(race.id,{edits:{removed:ed.removed||[],added:[...(ed.added||[]),{id:"e-"+uid(),r:x.id,t:at}]}}); toast("Finish added"); return }
+  if(t.dataset.rmtap){ const race=getRace(view.raceId); const ed=race.edits||{};
+    setRace(race.id,{edits:{added:ed.added||[],removed:[...(ed.removed||[]),t.dataset.rmtap]}}); toast("Tap removed"); return }
+  const act=t.dataset.act; if(!act)return;
+  const race=view.raceId?getRace(view.raceId):null;
+  if(act==="signin"){ backend.signIn().catch(e=>{console.error(e);toast("Sign-in didn't complete. Try again")}); return }
+  if(act==="signout"){ backend.signOut().then(()=>location.hash="#/"); return }
+  if(act==="copylink"){ const u=tkUrl(race); (navigator.clipboard?navigator.clipboard.writeText(u):Promise.reject()).then(()=>toast("Link copied"),()=>toast("Select the link and copy it")); return }
+  if(act==="sharelink"){ const u=tkUrl(race);
+    if(navigator.share) navigator.share({title:"Lapboard timekeeper: "+race.name,text:"Timekeeping link for "+race.name+":",url:u}).catch(()=>{});
+    else (navigator.clipboard?navigator.clipboard.writeText(u):Promise.reject()).then(()=>toast("Link copied"),()=>toast("Select the link and copy it")); return }
+  if(act==="rekey"){ arm("rekey",()=>rekey(race.id)); return }
+  if(act==="start") arm("start",()=>{ setRace(race.id,{startAt:Date.now(),status:"running",targetLaps:null}); requestWake(); toast("Race started") });
+  else if(act==="end") arm("end",()=>{ setRace(race.id,{status:"done"}); go({tab:admin()?"review":"timing"}) });
+  else if(act==="bellnow") arm("bellnow",()=>{ const c=compute(race,series[race.seriesId],Date.now()); setRace(race.id,{targetLaps:(c.leader?c.leader.laps:0)+1,lapsFrom:null}); });
+  else if(act==="lapsplus") setRace(race.id,{targetLaps:race.targetLaps+1});
+  else if(act==="lapsminus"){ const c=compute(race,series[race.seriesId],Date.now()); if(race.targetLaps-1>(c.leader?c.leader.laps:0)+1) setRace(race.id,{targetLaps:race.targetLaps-1}); }
+  else if(act==="dnfmode"){ dnfMode=!dnfMode; render(); }
+  else if(act==="reopen") { setRace(race.id,{status:"running"}); go({tab:"timing"}) }
+  else if(act==="reset") arm("reset",async()=>{ const ids=Object.keys(tapDocs); ownTaps=[]; ownRemoved=new Set();
+      setRace(race.id,{startAt:null,status:"setup",targetLaps:null,lapsFrom:null,dnf:[],...(admin()?{edits:{added:[],removed:[]}}:{})});
+      for(const id of ids) await enqueue("taps/"+id,()=>db.doc(livePath(race.id)+"/taps/"+id).delete()); toast("Race reset") });
+  else if(act==="checkall"){ const s=series[race.seriesId]; setRace(race.id,{checkedIn:Object.keys(s.riders||{})}) }
+  else if(act==="checknone") setRace(race.id,{checkedIn:[]});
+  else if(act==="publish"){ const s=series[race.seriesId]; const {out}=rankings(race,s,Date.now()); const rows={};
+    for(const cat in out) rows[cat]=out[cat].map(r=>({rid:r.x.id,pos:r.pos,num:r.x.rider.num,name:r.x.rider.name,laps:r.laps,
+      lapsText:r.status==="dns"?"–":r.behind?`${r.laps} (−${r.behind})`:String(r.laps),time:r.status==="fin"||r.status==="nofin"?r.time:null,gap:r.gap}));
+    setRace(race.id,{published:{at:Date.now(),rows},status:"published"}); toast("Results published"); go({tab:"results"}); }
+});
+document.addEventListener("change",e=>{
+  const t=e.target;
+  if(t.dataset.check){ const race=getRace(view.raceId); const set=new Set(race.checkedIn||[]); t.checked?set.add(t.dataset.check):set.delete(t.dataset.check); setRace(race.id,{checkedIn:[...set]}) }
+  if(t.id==="dur"){ const v=Math.max(5,Math.min(180,+t.value||45)); setRace(view.raceId,{durationMin:v}) }
+});
+document.addEventListener("input",e=>{ if(e.target.id==="ci-search"){ view.q=e.target.value; const pos=e.target.selectionStart; render(); const el=$("#ci-search"); el.focus(); try{el.setSelectionRange(pos,pos)}catch(_){} } });
+document.addEventListener("submit",async e=>{
+  e.preventDefault(); const f=e.target;
+  if(f.id==="newSeries"){ const name=$("#ns-name").value.trim(), kind=$("#ns-kind").value; if(!name)return;
+    const ref=db.collection("series").doc(); await enqueue("series/"+ref.id,()=>ref.set({name,kind,points:DEFAULT_POINTS,riders:{},createdAt:Date.now()}));
+    if(kind==="oneday") await enqueue("races/new",()=>createRace({seriesId:ref.id,name,date:new Date().toISOString().slice(0,10),durationMin:45}));
+    go({screen:"series",seriesId:ref.id,tab:"riders"}); }
+  if(f.id==="newRace"){ let rid=null;
+    await enqueue("races/new",async()=>{ rid=await createRace({seriesId:view.seriesId,name:$("#nr-name").value.trim()||"Race",date:$("#nr-date").value,durationMin:+$("#nr-min").value||45}) });
+    if(rid) go({screen:"race",raceId:rid,tab:"checkin"}); }
+  if(f.id==="addRider"||f.id==="newAtCheckin"){ const sid=f.id==="addRider"?view.seriesId:getRace(view.raceId).seriesId, s=series[sid];
+    const name=$("#"+f.id+"-name").value.trim(), num=+$("#"+f.id+"-num").value, cat=$("#"+f.id+"-cat").value; if(!name||!num)return;
+    if(Object.values(s.riders||{}).some(r=>r.num===num)){ toast(`Number ${num} is already taken`); return }
+    const rid="r"+uid(); series[sid]={...s,riders:{...(s.riders||{}),[rid]:{name,num,cat}}};
+    enqueue("series/"+sid,()=>db.doc("series/"+sid).update({riders:{[rid]:{name,num,cat}}}));
+    if(f.id==="newAtCheckin"){ const race=getRace(view.raceId); setRace(race.id,{checkedIn:[...(race.checkedIn||[]),rid]}) }
+    toast(`#${num} ${name} added`); render(); const nf=$("#"+f.id+"-name"); if(nf) nf.focus(); }
+  if(f.id==="addOrg"){ const e=$("#org-email").value.trim().toLowerCase(); if(!e||!e.includes("@"))return;
+    if(ownerEmails.includes(e)||(organisers.emails||[]).includes(e)){ toast(e+" is already an organiser"); return }
+    const emails=[...(organisers.emails||[]),e]; organisers={emails};
+    enqueue("config/organisers",()=>db.doc("config/organisers").set({emails})); toast(e+" added"); render(); }
+  if(f.id==="seriesSettings"){ const pts=$("#ss-points").value.split(/[,\s]+/).map(Number).filter(n=>!isNaN(n)&&n>=0);
+    const name=$("#ss-name").value.trim()||series[view.seriesId].name;
+    enqueue("series/"+view.seriesId,()=>db.doc("series/"+view.seriesId).update({name,points:pts})); series[view.seriesId]={...series[view.seriesId],name,points:pts}; toast("Settings saved"); render(); }
+});
+
+/* ---------- wake lock while timing ---------- */
+let wake=null;
+async function requestWake(){ try{ if(navigator.wakeLock&&!wake){ wake=await navigator.wakeLock.request("screen"); wake.addEventListener("release",()=>wake=null) } }catch(e){} }
+document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible"&&view.tab==="timing")requestWake() });
+setInterval(liveUpdate,1000);
+
+/* ---------- boot ---------- */
+
+function parseHash(){ const h=location.hash.replace(/^#\/?/,"").split("/");
+  if(h[0]==="admin") return {mode:"admin"};
+  if(h[0]==="t"&&h[1]&&h[2]) return {mode:"tk",raceId:h[1],key:h[2]};
+  if(h[0]==="r"&&h[1]) return {mode:"public",view:{screen:"race",raceId:h[1],tab:"results"}};
+  if(h[0]==="s"&&h[1]) return {mode:"public",view:{screen:"series",seriesId:h[1],tab:"races"}};
+  return {mode:"public",view:{screen:"home"}};
+}
+window.addEventListener("hashchange",()=>{ const p=parseHash();
+  if(p.mode!==mode||(p.mode==="tk"&&(p.key!==tkKey||p.raceId!==view.raceId))){ location.reload(); return }
+  if(p.view) go(p.view); });
+function startAdmin(){
+  backend.onAuth(u=>{ authUser=u; isAdmin=null; if(keysUnsub){keysUnsub();keysUnsub=null}
+    if(!u){ render(); return }
+    render();
+    keysUnsub=db.collection("raceKeys").onSnapshot(snap=>{ isAdmin=true; canWrite=true;
+      snap.docs.forEach(d=>{ const k=d.data().key; if(keys[d.id]!==k){ keys[d.id]=k; if(liveUnsubs[d.id]){liveUnsubs[d.id]();delete liveUnsubs[d.id]} } subLive(d.id) });
+      if(view.screen==="race")subTaps(view.raceId);
+      if(!orgUnsub) orgUnsub=db.doc("config/organisers").onSnapshot(sn=>{ organisers=sn.exists?sn.data():{emails:[]}; onData() },e=>console.error(e));
+      onData(); },
+      e=>{ console.error(e); isAdmin=false; render() });
+  });
+}
+(async()=>{
+  const p=parseHash(); mode=p.mode;
+  try{
+    if(window.__MOCK_BACKEND) backend=window.__MOCK_BACKEND;
+    else { const m=await import("./backend.js"); backend=m.createBackend(); }
+    ownerEmails=((backend&&backend.ownerEmails)||[]).map(e=>e.toLowerCase());
+  }catch(e){ console.error(e); backend=null }
+  db=backend&&backend.db;
+  if(!db){ render(); return }
+  if(mode==="tk"){ tkKey=p.key; canWrite=true; view={screen:"race",raceId:p.raceId,seriesId:null,tab:"timing"}; subLive(p.raceId); subTaps(p.raceId) }
+  else if(p.view) view={...view,...p.view};
+  db.collection("series").onSnapshot(snap=>{ for(const k in series)delete series[k]; snap.docs.forEach(d=>series[d.id]=d.data()); seriesLoaded=true; onData() },e=>console.error(e));
+  db.collection("races").onSnapshot(snap=>{ for(const k in races)delete races[k]; snap.docs.forEach(d=>races[d.id]={id:d.id,...d.data()}); loaded=true;
+    if(mode==="tk"&&races[view.raceId]&&lives[view.raceId]&&!view.seriesId) view.seriesId=races[view.raceId].seriesId; onData() },e=>console.error(e));
+  if(mode==="admin") startAdmin();
+  render();
+})();
