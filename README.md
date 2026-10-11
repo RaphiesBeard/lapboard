@@ -18,6 +18,8 @@ It is a static site (plain HTML, CSS and JavaScript, no build step) using Fireba
 
 Other organisers are added by the owner on the Organisers page in the app.
 
+A how-to guide for riders, timekeepers and organisers is built in at `/#/help`.
+
 ## How data is stored
 
 | Path | Who can read | Who can write |

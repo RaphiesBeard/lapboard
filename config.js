@@ -11,4 +11,4 @@ export const firebaseConfig = {
 
 // The owner's Google account email(s). Owners can add and remove other organisers in the app.
 // Must match the owner list in firestore.rules.
-export const ownerEmails = ["REPLACE_WITH_OWNER_EMAIL"];
+export const ownerEmails = ["jonathan.hp.poole@gmail.com"];

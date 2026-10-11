@@ -19,6 +19,12 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok(await p.isVisible('text=No published results yet'),'unpublished races hidden from public');
   ok(!(await p.isVisible('text=Settings')),'no settings tab for public');
   ok(p.errs.length===0,'public: no errors '+p.errs);
+  p=await page('#/help');
+  ok(await p.isVisible('text=Finding your results'),'public help page');
+  await p.click('[data-tab=organisers]');await p.waitForTimeout(80);
+  ok(await p.isVisible('text=Send the timekeeper link'),'organiser guide tab');
+  await p.screenshot({path:shots+'/h-help.png',fullPage:true});
+  ok(p.errs.length===0,'help: no errors '+p.errs);
   // admin
   p=await page('#/admin');
   ok(await p.isVisible('text=Sign in with Google'),'admin asks to sign in');
@@ -88,6 +94,10 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   await p.click('#d-controls summary');await p.click('[data-act=reset]');await p.click('[data-act=reset]');await p.waitForTimeout(300);
   ok(await p.evaluate(()=>![...window.__store.keys()].some(k=>k.startsWith('races/bc-r2/live/k2/taps/'))&&!window.__store.get('races/bc-r2/live/k2').startAt),'timekeeper can reset a race');
   ok(p.errs.length===0,'timekeeper: no errors '+p.errs);
+  await p.click('text=How to use Lapboard');await p.waitForTimeout(100);
+  ok(await p.isVisible('text=Tap each number as it crosses the line'),'timekeeper help opens on timekeeper guide');
+  await p.click('.stack > div > button.btn');await p.waitForTimeout(100);
+  ok(await p.isVisible('#grid'),'back from help returns to timing: '+(await p.textContent('#app')).slice(0,120));
   p=await page('#/t/bc-r2/wrongkey');await p.waitForTimeout(300);
   ok(await p.isVisible("text=This link isn't valid any more"),'wrong key shows invalid link');
   // public results with published data

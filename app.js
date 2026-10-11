@@ -186,7 +186,7 @@ function onData(){ if(view.screen==="race"&&view.tab==="timing"&&$("#grid")){ if
 /* ---------- navigation ---------- */
 const admin=()=>mode==="admin"&&isAdmin===true;
 function go(v){ view={...view,...v}; armed=null; dnfMode=false;
-  if(mode==="public"){ const h=view.screen==="race"?"#/r/"+view.raceId:view.screen==="series"?"#/s/"+view.seriesId:"#/";
+  if(mode==="public"){ const h=view.screen==="race"?"#/r/"+view.raceId:view.screen==="series"?"#/s/"+view.seriesId:view.screen==="help"?"#/help"+(view.tab?"/"+view.tab:""):"#/";
     if(location.hash!==h) history.replaceState(null,"",h); }
   if(view.screen==="race"&&view.raceId){ subLive(view.raceId); subTaps(view.raceId); }
   window.scrollTo(0,0); render(); }
@@ -207,7 +207,8 @@ function render(){
   if(view.screen==="race"&&races[view.raceId]&&races[view.raceId].archived&&mode==="public") view.screen="home";
   if(view.screen==="race"&&!races[view.raceId]) view.screen=view.seriesId&&series[view.seriesId]?"series":"home";
   timingKey="";
-  if(view.screen==="home") app.innerHTML=renderHome();
+  if(view.screen==="help") app.innerHTML=renderHelp();
+  else if(view.screen==="home") app.innerHTML=renderHome();
   else if(view.screen==="orgs") app.innerHTML=admin()?renderOrgs():renderHome();
   else if(view.screen==="series") app.innerHTML=renderSeries();
   else app.innerHTML=renderRace();
@@ -348,9 +349,60 @@ function renderSignIn(){
     <p class="note"><a href="#/">See public results</a></p></div>`;
 }
 function footer(){
-  if(mode==="tk") return `<div class="foot"><span>Lapboard timekeeper · this phone records as ${esc(deviceId)}</span></div>`;
-  if(mode==="admin") return `<div class="foot"><span>Signed in as ${esc(authUser&&authUser.email)}</span><button class="btn sm ghost" data-act="signout">Sign out</button><a href="#/">Public view</a></div>`;
-  return `<div class="foot"><a href="#/admin">Organiser sign-in</a></div>`;
+  const help=t=>`<button class="btn sm ghost" data-go='${esc(JSON.stringify({screen:"help",tab:t,back:{screen:view.screen,tab:view.tab}}))}'>How to use Lapboard</button>`;
+  if(mode==="tk") return `<div class="foot">${help("timekeepers")}<span>This phone records as ${esc(deviceId)}</span></div>`;
+  if(mode==="admin") return `<div class="foot">${help("organisers")}<span>Signed in as ${esc(authUser&&authUser.email)}</span><button class="btn sm ghost" data-act="signout">Sign out</button><a href="#/">Public view</a></div>`;
+  return `<div class="foot">${help("riders")}<a href="#/admin">Organiser sign-in</a></div>`;
+}
+function renderHelp(){
+  const tabs=[{id:"riders",label:"Riders"},{id:"timekeepers",label:"Timekeepers"},{id:"organisers",label:"Organisers"}];
+  if(!tabs.some(t=>t.id===view.tab)) view.tab=mode==="tk"?"timekeepers":mode==="admin"?"organisers":"riders";
+  const back=view.back&&view.back.screen!=="help"?{...view.back,back:null}:{screen:mode==="tk"?"race":"home",tab:mode==="tk"?"timing":null};
+  const step=(title,body)=>`<li><b>${title}</b><br>${body}</li>`;
+  const sec=(title,items)=>`<div class="card"><h2>${title}</h2><ol class="help">${items.join("")}</ol></div>`;
+  let body="";
+  if(view.tab==="riders") body=sec("Finding your results",[
+    step("Open the results page","Use the link the organisers share. No account is needed."),
+    step("Pick your series and race","Each published race lists Men and Women separately, with your position, total time and gap to the winner."),
+    step("Reading the gap","<i>+0:42</i> means you finished on the same lap as the winner, 42 seconds behind. <i>−1 lap</i> means the leader lapped you once. The winner's lap count is shown above each table."),
+    step("DNF and DNS","DNF means you started but didn't finish. DNS means you were checked in but never crossed the line."),
+    step("Series standings","Open the Standings tab of a series to see points from every published race (R1, R2…) and the running total."),
+  ]);
+  else if(view.tab==="timekeepers") body=sec("Before the start",[
+    step("Open the timekeeper link","The organiser sends it by text or WhatsApp. It works only for that race and needs no account. Tip: add it to your home screen."),
+    step("Check riders in","On the Check-in tab, tick everyone who is racing. Only checked-in riders appear on the timing screen. Search by name or number, or tap <i>Check in everyone</i>."),
+    step("Two timekeepers? Split the riders","On the Timing tab, each phone picks a group: Men / Women, or Odd # / Even #. Both phones record into the same race."),
+    step("Start the race","Tap <i>Start race</i>, then tap again to confirm, as the riders go. Only one phone needs to do this."),
+  ])+sec("During the race",[
+    step("Tap each number as it crosses the line","A message confirms it, for example <i>#12 lap 3</i>. If both phones tap the same rider within 20 seconds, it only counts once, so double taps are safe."),
+    step("Made a mistake?","Tap <i>Undo</i> next to it under <i>Your last taps</i>."),
+    step("Watch the Coming up strip","Riders due at the line in the next minute appear at the top, soonest first, so you can tap them there. A dashed outline means a rider is overdue: you may have missed them, or they may have stopped."),
+    step("Number of laps and the bell","After the leader's second lap, Lapboard sets the number of laps so the race finishes close to the target time. It tells you when to ring the bell. You can add or remove a lap before the bell."),
+    step("Someone stops?","Tap <i>Mark DNF</i>, then tap their number."),
+    step("Patchy signal","Keep tapping. Taps are saved on the phone and sent when the signal comes back. The screen stays awake while timing."),
+  ])+sec("At the finish",[
+    step("The leader finishes","After the leader crosses on the last lap, every rider's next crossing is their finish. The banner counts how many are in. Lapped riders finish on fewer laps."),
+    step("End the race","When everyone is in, tap <i>End race</i> twice. The organiser checks the laps and publishes the results."),
+  ]);
+  else body=sec("Setting up",[
+    step("Sign in",`Go to the organiser page (<i>${esc(location.origin+location.pathname)}#/admin</i>) and sign in with your Google account.`),
+    step("Create a series","For example <i>Biscuit Cup 2026</i>. Choose <i>One-day race</i> for a single event like the Intergalactics."),
+    step("Register riders","On the Riders tab, add each rider's name, number and category. Riders keep their number for the whole series."),
+    step("Set the points","On the Settings tab, enter the points for 1st, 2nd, 3rd and so on. They apply to Men and Women separately."),
+    step("Add a race","On the Races tab, give it a name, date and length in minutes (for example 45)."),
+    step("Send the timekeeper link","Open the race. The Check-in tab has a <i>Timekeeper link</i> card. Tap <i>Share</i> to send it. If a link gets passed around, make a new one and the old one stops working."),
+  ])+sec("Race day",[
+    step("Check-in and timing","You can do these yourself or leave them to your timekeepers. The steps are the same: see the Timekeepers guide."),
+    step("New rider on the day","On the Check-in tab, use <i>New rider today</i>. They are added to the series and checked in."),
+  ])+sec("After the race",[
+    step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i>: tap <i>Mark DNF</i> or <i>Add finish now</i>."),
+    step("Publish","Tap <i>Publish results</i>. The race appears on the public results page and the series standings update. If you change anything later, tap <i>Republish results</i>."),
+    step("Share the results","Send riders the results page address. Each race and series has its own link you can copy from the address bar."),
+  ])+sec("Managing",[
+    step("Other organisers","On the home screen, tap <i>Organisers</i>. The owner can add a friend's Gmail address so they can sign in and manage everything."),
+    step("Archive","In a series' Settings, archive a race or the whole series. Archived items are hidden from everyone. Restore them from <i>Archive</i> on the home screen, which is also the only place to delete something for good."),
+  ]);
+  return header([{label:"Lapboard",go:back}],"How to use Lapboard",null,tabs)+`<div class="stack">${body}<div><button class="btn" data-go='${esc(JSON.stringify(back))}'>Back</button></div></div>`;
 }
 function renderCheckin(race,s){
   const rs=ridersOf(s), inn=new Set(race.checkedIn||[]);
@@ -621,6 +673,7 @@ function parseHash(){ const h=location.hash.replace(/^#\/?/,"").split("/");
   if(h[0]==="t"&&h[1]&&h[2]) return {mode:"tk",raceId:h[1],key:h[2]};
   if(h[0]==="r"&&h[1]) return {mode:"public",view:{screen:"race",raceId:h[1],tab:"results"}};
   if(h[0]==="s"&&h[1]) return {mode:"public",view:{screen:"series",seriesId:h[1],tab:"races"}};
+  if(h[0]==="help") return {mode:"public",view:{screen:"help",tab:h[1]||"riders"}};
   return {mode:"public",view:{screen:"home"}};
 }
 window.addEventListener("hashchange",()=>{ const p=parseHash();

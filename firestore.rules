@@ -14,7 +14,7 @@ service cloud.firestore {
     }
     function isOwner() {
       // Owner emails, lower case. Keep in sync with ownerEmails in config.js.
-      return signedIn() && email() in ["REPLACE_WITH_OWNER_EMAIL"];
+      return signedIn() && email() in ["jonathan.hp.poole@gmail.com"];
     }
     function isAdmin() {
       return isOwner() || (signedIn()
