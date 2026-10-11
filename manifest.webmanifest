@@ -1,0 +1,15 @@
+{
+  "id": "./",
+  "name": "Lapboard",
+  "short_name": "Lapboard",
+  "description": "Cyclocross lap timing and race results",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#eceeea",
+  "theme_color": "#e2530f",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

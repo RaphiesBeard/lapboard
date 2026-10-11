@@ -446,6 +446,7 @@ function renderHelp(){
   ]);
   else if(view.tab==="timekeepers") body=sec("Before the start",[
     step("Open the timekeeper link","The organiser sends it by text or WhatsApp. It works only for that race and needs no account. Tip: add it to your home screen."),
+    step("Put it on your Home Screen","Open the page you use most (your timekeeper link, or the organiser page), then on iPhone tap Share › <i>Add to Home Screen</i>, or on Android tap the ⋮ menu › <i>Add to Home screen</i>. It opens full screen like an app. Use the ‹ Back button at the top to move around."),
     step("Check riders in","On the Check-in tab, tick everyone who is racing. Only checked-in riders appear on the timing screen. Search by name or number, or tap <i>Check in everyone</i>."),
     step("New rider on the day","Someone not on the list? Use <i>New rider today</i> at the bottom of Check-in. Give them the next free number. They are checked in straight away and kept in the series for next time."),
     step("Two timekeepers? Split the riders","On the Timing tab, each phone picks a group: Men / Women, or Odd # / Even #. Both phones record into the same race."),
