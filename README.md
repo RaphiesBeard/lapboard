@@ -25,9 +25,9 @@ A how-to guide for riders, timekeepers and organisers is built in at `/#/help`.
 | Path | Who can read | Who can write |
 | --- | --- | --- |
 | `series/{id}`: name, points table, riders | everyone | organisers |
-| `races/{id}`: name, date, review edits, published results | everyone | organisers |
+| `races/{id}`: name, date, review edits (`edits.added` crossings and `edits.removed` tap ids, made on the Review tab with *Edit laps*; the timekeepers' taps themselves are never changed), published results | everyone | organisers |
 | `raceKeys/{id}`: the timekeeper link key | organisers | organisers |
-| `races/{id}/live/{key}`: start time, laps target, check-in, DNFs, riders a timekeeper registered (`newRiders`, copied into the series next time an organiser opens Lapboard) | link holders, organisers | link holders, organisers |
+| `races/{id}/live/{key}`: start time, laps target, check-in, DNFs, DNSs, end time, riders a timekeeper registered (`newRiders`, copied into the series next time an organiser opens Lapboard) | link holders, organisers | link holders, organisers |
 | `races/{id}/live/{key}/taps/{device}`: each phone's lap taps | link holders, organisers | link holders, organisers |
 | `config/organisers`: extra organiser emails and usernames | organisers | owner |
 

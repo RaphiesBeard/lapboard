@@ -7,7 +7,7 @@ const DEDUP_MS = 20000;            // two taps on one rider closer than this cou
 const DEFAULT_POINTS = [25,20,16,13,11,10,9,8,7,6,5,4,3,2,1];
 const CATS = {M:"Men", F:"Women"};
 // Race fields that change during a race live in races/RACE/live/KEY, which timekeepers can write.
-const LIVE_FIELDS = new Set(["startAt","status","targetLaps","lapsFrom","checkedIn","dnf","durationMin","newRiders"]);
+const LIVE_FIELDS = new Set(["startAt","status","targetLaps","lapsFrom","checkedIn","dnf","durationMin","newRiders","dns","endedAt"]);
 // Riders a timekeeper registers go in the live doc (newRiders) until an organiser's app copies them into the series.
 
 let backend=null, db=null, canWrite=false;
@@ -75,12 +75,14 @@ function compute(race, s, now){
   const taps=start?allTapsFor(race):[];
   for(const t of taps) if(riders[t.r]) ids.add(t.r);
   const by={}; ids.forEach(id=>{ if(riders[id]) by[id]=[] });
-  for(const t of taps){ if(t.t<start||!by[t.r])continue; by[t.r].push(t) }
+  const dnsSet=new Set(race.dns||[]), ignored={};
+  for(const t of taps){ if(t.t<start||!by[t.r])continue; if(dnsSet.has(t.r)){ ignored[t.r]=(ignored[t.r]||0)+1; continue } by[t.r].push(t) }
   const R={};
   for(const id in by){
     const list=by[id].sort((a,b)=>a.t-b.t), cr=[], dupes=[];
-    for(const t of list){ if(cr.length&&t.t-cr[cr.length-1].t<DEDUP_MS) dupes.push(t); else cr.push(t) }
-    R[id]={id, rider:riders[id], all:cr, dupes};
+    const groups={};   // crossing tap id -> ids of every tap that counted as that crossing
+    for(const t of list){ if(cr.length&&t.t-cr[cr.length-1].t<DEDUP_MS){ dupes.push(t); groups[cr[cr.length-1].id].push(t.id) } else { cr.push(t); groups[t.id]=[t.id] } }
+    R[id]={id, rider:riders[id], all:cr, dupes, groups};
   }
   let finishAt=null;
   if(race.targetLaps){ for(const id in R){const c=R[id].all; if(c.length>=race.targetLaps){const t=c[race.targetLaps-1].t; if(finishAt==null||t<finishAt)finishAt=t}} }
@@ -91,7 +93,7 @@ function compute(race, s, now){
     x.cr=counted; x.laps=counted.length; x.fin=fin; x.finishT=finishT;
     x.lapTimes=counted.map((c,i)=>c.t-(i?counted[i-1].t:start));
     x.last=x.laps?counted[x.laps-1].t:start;
-    x.dnf=(race.dnf||[]).includes(id);
+    x.dns=dnsSet.has(id); x.ignored=ignored[id]||0; x.dnf=!x.dns&&(race.dnf||[]).includes(id);
     if(x.laps) firstLaps.push(x.lapTimes[0]);
   }
   const fl=median(firstLaps);
@@ -106,7 +108,10 @@ function compute(race, s, now){
   let pred=null;
   const D=(race.durationMin||45)*60000;
   if(leader&&start&&leader.laps>=2){
-    const lt=leader.lapTimes, lap2=lt[1], e2=leader.cr[1].t-start;
+    const lt=leader.lapTimes, e2=leader.cr[1].t-start;
+    // A stray or missed tap makes lap 2 far too short or long (e.g. 30 laps instead of 8). Lap 1 includes the start,
+    // so it is normally a little longer than lap 2; if lap 2 is wildly different, use lap 1 instead.
+    const lap2 = lt[1]>=lt[0]*0.6&&lt[1]<=lt[0]*1.6 ? lt[1] : lt[0];
     let best=null;
     for(let N=2;N<=80;N++){const proj=e2+(N-2)*lap2; if(!best||Math.abs(proj-D)<Math.abs(best.proj-D))best={N,proj}}
     const recent=lt.length>=2?mean(lt.slice(Math.max(1,lt.length-3))):lt[0];
@@ -114,6 +119,58 @@ function compute(race, s, now){
   }
   return {R, leader, finishAt, pred, start};
 }
+/* ---------- organiser lap edits (stored in race.edits; the timekeepers' taps are never changed) ---------- */
+function parseRaceTime(str){ const m=String(str||"").trim().match(/^(?:(\d+)[:.])?(\d{1,3})[:.](\d{1,2})$/); if(!m)return null;
+  const h=+(m[1]||0), mi=+m[2], se=+m[3]; if(se>59||(m[1]&&mi>59))return null; return ((h*60+mi)*60+se)*1000 }
+function rawTapsFor(race){ const out=[]; for(const [docId,d] of Object.entries(tapDocs)) out.push(...(docId===deviceId?ownTaps:(d.taps||[])));
+  if(tapDocs[deviceId]===undefined) out.push(...ownTaps); out.push(...(((race.edits||{}).added)||[])); return out }
+function editTaps(race,{add=[],remove=[]}){
+  const ed=race.edits||{}, rm=new Set(remove);
+  const added=(ed.added||[]).filter(t=>!rm.has(t.id));                 // an organiser's own added tap is simply dropped
+  const addedIds=new Set((ed.added||[]).map(t=>t.id));
+  const removed=[...new Set([...(ed.removed||[]),...remove.filter(id=>!addedIds.has(id))])];
+  setRace(race.id,{edits:{added:[...added,...add.map(t=>({id:"e-"+uid(),r:t.r,t:Math.round(t.t)}))],removed}});
+}
+function riderEditCount(race,rid){ const ed=race.edits||{}; const mine=new Set(rawTapsFor(race).filter(t=>t.r===rid).map(t=>t.id));
+  return (ed.added||[]).filter(t=>t.r===rid).length+(ed.removed||[]).filter(id=>mine.has(id)).length }
+function resetRiderEdits(race,rid){ const ed=race.edits||{}; const mine=new Set(rawTapsFor(race).filter(t=>t.r===rid).map(t=>t.id));
+  setRace(race.id,{edits:{added:(ed.added||[]).filter(t=>t.r!==rid),removed:(ed.removed||[]).filter(id=>!mine.has(id))}}) }
+function lapAction(kind,rid,i,value){
+  const race=getRace(view.raceId), c=compute(race,series[race.seriesId],Date.now()), x=c.R[rid]; if(!x)return;
+  const cr=x.all[i]; if(!cr)return; const prevT=i?x.all[i-1].t:race.startAt, nextT=x.all[i+1]?x.all[i+1].t:null, n=x.rider.num;
+  if(kind==="split"){
+    if(cr.t-prevT<2*DEDUP_MS){ toast("That lap is too short to split"); return }
+    editTaps(race,{add:[{r:rid,t:(prevT+cr.t)/2}]}); toast(`#${n} lap ${i+1} split in two. Change either time if you know it`); return }
+  if(kind==="delete"){ editTaps(race,{remove:x.groups[cr.id]||[cr.id]});
+    toast(x.all[i+1]?`#${n} crossing removed: laps ${i+1} and ${i+2} are now one lap`:`#${n} last crossing removed`); return }
+  if(kind==="time"){ const ms=parseRaceTime(value); if(ms==null||ms<=0){ toast("Type the race time like 23:15 or 1:02:30"); return false }
+    const t=race.startAt+ms;
+    if(t<=prevT+DEDUP_MS-1||(nextT!=null&&t>=nextT-DEDUP_MS+1)){ toast(`Pick a time between ${fmt(prevT-race.startAt)} and ${nextT!=null?fmt(nextT-race.startAt):"the end"}. To move it further, delete it and add a new one`); return false }
+    editTaps(race,{remove:x.groups[cr.id]||[cr.id],add:[{r:rid,t}]}); toast(`#${n} lap ${i+1} now ends at ${fmt(ms)}`); return true }
+}
+function addCrossing(rid,value){
+  const race=getRace(view.raceId), c=compute(race,series[race.seriesId],Date.now()), x=c.R[rid]; if(!x)return false;
+  const ms=parseRaceTime(value); if(ms==null||ms<=0){ toast("Type the race time like 23:15 or 1:02:30"); return false }
+  const t=race.startAt+ms; if(x.all.some(cr=>Math.abs(cr.t-t)<DEDUP_MS)){ toast(`#${x.rider.num} already has a crossing within ${DEDUP_MS/1000} seconds of ${fmt(ms)}`); return false }
+  editTaps(race,{add:[{r:rid,t}]}); toast(`Crossing added for #${x.rider.num} at ${fmt(ms)}`); return true }
+function renderLapEditor(race,x){
+  const start=race.startAt, fl=flagsFor(x), flagged=new Set(fl.map(f=>f.lap)), rows=x.all.map((cr,i)=>{ const prev=i?x.all[i-1].t:start, after=x.fin&&cr.t>x.finishT, n=(x.groups[cr.id]||[]).length;
+    const editing=view.lapTime===x.id+"|"+i;
+    return `<div class="lerow ${after?"after":""} ${cr.added?"edited":""} ${flagged.has(i)?"flagged":""}">
+      <div class="lehead"><b>${after?"After finish":"Lap "+(i+1)}</b> <span class="t">${fmt(cr.t-prev)}</span>
+        <span class="muted small">ends ${fmt(cr.t-start)}${cr.added?" · edited":""}${n>1?` · ${n} taps`:""}${x.fin&&cr.t===x.finishT?" · finish":""}</span></div>
+      ${editing?`<form class="flagrow" id="lapTime" data-rid="${x.id}" data-i="${i}"><input type="text" id="lt-val" inputmode="numeric" value="${esc(view.lapTimeVal!=null?view.lapTimeVal:fmt(cr.t-start))}" aria-label="Race time this lap ends" style="width:7em">
+          <button class="btn sm primary" type="submit">Save</button><button class="btn sm ghost" type="button" data-laptime="">Cancel</button></form>`
+        :`<div class="flagrow" style="margin:0"><button class="btn sm" data-lapsplit="${x.id}|${i}">Split</button><button class="btn sm" data-laptime="${x.id}|${i}">Change time</button><button class="btn sm danger" data-lapdel="${x.id}|${i}">Delete</button></div>`}
+    </div>` }).join("");
+  const changes=riderEditCount(race,x.id);
+  return `<div class="lapedit" id="lapedit-${x.id}"><h3 style="margin:0">Laps for #${x.rider.num} ${esc(x.rider.name)}</h3>
+    <p class="note">Times are race time from the start. <b>Split</b> turns one long lap into two (you can then fix either time). <b>Delete</b> removes a crossing, joining that lap with the next. The timekeepers' original taps are kept, so you can undo.</p>
+    ${rows||`<p class="small muted">No laps recorded.</p>`}
+    <form class="flagrow" id="addCrossing" data-rid="${x.id}"><input type="text" id="ac-val" inputmode="numeric" placeholder="e.g. 23:15" aria-label="Race time of a missing crossing" style="width:7em"><button class="btn sm" type="submit">Add a crossing</button></form>
+    <div class="flagrow">${changes?`<button class="btn sm ${armed==="resetlaps-"+x.id?"arm":"ghost"}" data-lapreset="${x.id}">${armLabel("resetlaps-"+x.id,`Undo all ${changes} change${changes>1?"s":""} to #${x.rider.num}`,"Tap again to undo")}</button>`:""}
+      <button class="btn sm ghost" data-lapedit="">Done</button></div>
+  </div>` }
 function flagsFor(x){
   const out=[]; const lt=x.lapTimes; if(lt.length<3)return out;
   const med=median(lt.slice(1));
@@ -128,10 +185,10 @@ function rankings(race,s,now){
   const out={};
   for(const cat of Object.keys(CATS)){
     const xs=Object.values(c.R).filter(x=>x.rider.cat===cat);
-    const fin=xs.filter(x=>x.fin&&!x.dnf).sort((a,b)=>b.laps-a.laps||a.finishT-b.finishT);
+    const fin=xs.filter(x=>x.fin&&!x.dnf&&!x.dns).sort((a,b)=>b.laps-a.laps||a.finishT-b.finishT);
     const run=xs.filter(x=>!x.fin&&!x.dnf&&x.laps>0).sort((a,b)=>b.laps-a.laps||a.last-b.last);
     const dnf=xs.filter(x=>x.dnf).sort((a,b)=>b.laps-a.laps||a.last-b.last);
-    const dns=xs.filter(x=>!x.dnf&&!x.fin&&x.laps===0).sort((a,b)=>a.rider.num-b.rider.num);
+    const dns=xs.filter(x=>x.dns||(!x.dnf&&!x.fin&&x.laps===0)).sort((a,b)=>a.rider.num-b.rider.num);
     const win=fin[0]||run[0];
     const rows=[]; let pos=0;
     for(const x of [...fin,...run]){ pos++;
@@ -204,7 +261,7 @@ const navState=()=>{ const o={}; NAV_KEYS.forEach(k=>o[k]=view[k]??null); return
 const navHash=()=>mode!=="public"?location.hash:view.screen==="race"?"#/r/"+view.raceId:view.screen==="series"?"#/s/"+view.seriesId:view.screen==="help"?"#/help"+(view.tab?"/"+view.tab:""):view.screen==="find"?"#/find":"#/";
 let navDepth=0;
 function go(v,opts={}){ const before=JSON.stringify(navState());
-  view={...view,madeLogin:null,editRider:null,...v}; armed=null; dnfMode=false;
+  view={...view,madeLogin:null,editRider:null,lapEdit:null,lapTime:null,...v}; armed=null; dnfMode=false;
   if(!opts.fromHistory&&JSON.stringify(navState())!==before){
     const h=navHash();
     if(opts.replace) history.replaceState({lb:navState(),depth:navDepth},"",h);
@@ -216,7 +273,7 @@ window.addEventListener("popstate",e=>{ const st=e.state; if(!st||!st.lb)return;
 
 /* ---------- render ---------- */
 function header(crumbs,title,right,tabs){
-  return `<div class="top"><div class="crumbs">${navDepth>0?`<button class="navback" data-act="navback" aria-label="Back">‹ Back</button><span class="sep" aria-hidden="true">·</span>`:""}${crumbs.map(c=>c.go?`<button data-go='${esc(JSON.stringify(c.go))}'>${esc(c.label)}</button>`:`<span>${esc(c.label)}</span>`).join("<span>/</span>")}</div>
+  return `<div class="top"><div class="crumbs">${(()=>{ const up=[...crumbs].reverse().find(c=>c.go); return up?`<button class="navback" data-go='${esc(JSON.stringify(up.go))}' aria-label="Back to ${esc(up.label)}">‹ Back</button><span class="sep" aria-hidden="true">·</span>`:"" })()}${crumbs.map(c=>c.go?`<button data-go='${esc(JSON.stringify(c.go))}'>${esc(c.label)}</button>`:`<span>${esc(c.label)}</span>`).join("<span>/</span>")}</div>
   <div class="titlerow"><h1>${esc(title)}</h1>${right||""}</div>
   ${tabs?`<div class="tabs" role="tablist">${tabs.map(t=>`<button data-tab="${t.id}" aria-current="${view.tab===t.id}">${t.label}</button>`).join("")}</div>`:""}</div>`;
 }
@@ -475,6 +532,8 @@ function renderHelp(){
     step("New rider on the day","On the Check-in tab, use <i>New rider today</i>. They are added to the series and checked in. Timekeepers can do this too, and their new riders appear in the series as soon as you open Lapboard."),
   ])+sec("After the race",[
     step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i>: tap <i>Mark DNF</i> or <i>Add finish now</i>."),
+    step("Fix any lap yourself","Tap <i>Edit laps</i> under a rider. <i>Split</i> turns one long lap into two, <i>Delete</i> removes a crossing (joining it to the next lap), and <i>Change time</i> moves a crossing. Type a missing one under <i>Add a crossing</i>, as race time like 23:15. Positions, laps and gaps update straight away. The original taps are kept, so <i>Undo all changes</i> puts that rider back."),
+    step("Someone checked in by mistake?","Tap <i>Mark DNS</i> under their name on the Review tab. Any taps on their number are ignored and they show as DNS. If the lap count looks wrong (for example a stray tap made it 30 laps), type the real number in <i>Laps the winner raced</i>."),
     step("Publish","Tap <i>Publish results</i>. The race appears on the public results page and the series standings update. If you change anything later, tap <i>Republish results</i>."),
     step("Share the results","Send riders the results page address. Each race and series has its own link you can copy from the address bar."),
   ])+sec("Managing",[
@@ -519,7 +578,7 @@ function renderTiming(race,s){
   const started=!!race.startAt;
   const ended=race.status==="done"||race.status==="published";
   return `<div class="stack" style="gap:12px">
-  <div class="clockbar"><div><div class="tag">Race time</div><div class="clock" id="clock">${started?"0:00":"–:––"}<small>/ ${race.durationMin||45}:00</small></div></div>
+  <div class="clockbar"><div><div class="tag" id="clocktag">Race time</div><div class="clock" id="clock">${started?"0:00":"–:––"}<small>/ ${race.durationMin||45}:00</small></div></div>
     <div class="row" style="justify-content:flex-end">
       ${!started?`<button class="btn ${armed==="start"?"arm":"primary"}" data-act="start" ${inn.size?"":"disabled"}>${armLabel("start","Start race","Tap again to start")}</button>`:""}
       ${started&&!ended?`<button class="btn sm ${armed==="end"?"arm":""}" data-act="end">${armLabel("end","End race","Tap again to end")}</button>`:""}
@@ -544,7 +603,11 @@ function liveUpdate(){
   const race=getRace(view.raceId), s=series[race.seriesId], now=Date.now();
   const c=compute(race,s,now), started=!!race.startAt, ended=race.status==="done"||race.status==="published";
   const el=started?now-race.startAt:0;
-  $("#clock").firstChild.nodeValue=started?fmt(ended&&c.finishAt?c.finishAt-race.startAt:el):"–:––";
+  // The clock stops at the winner's finish, or when the race is ended.
+  const lastT=Math.max(race.startAt||0,...Object.values(c.R).map(x=>x.all.length?x.all[x.all.length-1].t:0));
+  const stopAt=c.finishAt!=null?c.finishAt:ended?(race.endedAt||lastT):null;
+  $("#clock").firstChild.nodeValue=started?fmt(stopAt!=null?stopAt-race.startAt:el):"–:––";
+  const ct=$("#clocktag"); if(ct) ct.textContent=c.finishAt!=null?"Winner's time":ended?"Race ended at":"Race time";
   // banner
   let b="";
   if(!started) b=`<div class="banner"><p>Press <b>Start race</b> as the riders go. Then tap each number as it crosses the line.</p></div>`;
@@ -567,7 +630,7 @@ function liveUpdate(){
   document.querySelectorAll("#grid .plate").forEach(btn=>{ const id=btn.dataset.tap, x=c.R[id]; inView.add(id); if(!x)return;
     const due=started&&!ended&&!x.fin&&!x.dnf&&x.expected!=null&&x.expected-now<45000;
     btn.classList.toggle("due",due&&!x.overdue); btn.classList.toggle("over",x.overdue&&!ended); btn.classList.toggle("fin",x.fin); btn.classList.toggle("dnf",x.dnf);
-    const lp=btn.querySelector(".lp"); lp.textContent=x.dnf?"DNF":x.fin?"✓ "+x.laps+" laps":x.overdue?"overdue":x.laps?"lap "+x.laps:"–";
+    const lp=btn.querySelector(".lp"); lp.textContent=x.dns?"DNS":x.dnf?"DNF":x.fin?"✓ "+x.laps+" laps":x.overdue?"overdue":x.laps?"lap "+x.laps:"–";
     if(!dnfMode) btn.disabled=!started||ended||x.fin||x.dnf; });
   // strip: due riders, soonest first
   const up=started&&!ended?Object.values(c.R).filter(x=>inView.has(x.id)&&!x.fin&&!x.dnf&&x.expected!=null&&x.expected-now<75000).sort((a,b)=>a.expected-b.expected).slice(0,8):[];
@@ -590,18 +653,23 @@ function renderReview(race,s){
       if(possibleDnf)flags++;
       const missedLaps=new Set(fl.filter(f=>f.type==="missed").map(f=>f.lap)), shortLaps=new Set(fl.filter(f=>f.type==="short").map(f=>f.lap));
       return `<tr><td class="pos">${row.pos}</td><td><span class="plate-sm">${x.rider.num}</span> ${esc(x.rider.name)}
-        ${x.lapTimes.length?`<div class="laps">${x.lapTimes.map((v,i)=>`<span class="${missedLaps.has(i)?"flag":shortLaps.has(i)?"short":""}">L${i+1} ${fmt(v)}</span>`).join("")}</div>`:""}
+        ${x.lapTimes.length?`<div class="laps">${x.lapTimes.map((v,i)=>`<span class="${missedLaps.has(i)?"flag":shortLaps.has(i)?"short":""}"><b class="ln">L${i+1}</b>${fmt(v)}</span>`).join("")}</div>`:""}
         ${fl.map(f=>f.type==="missed"?`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} looks like 2 laps</span><button class="btn sm" data-addtap="${x.id}|${f.insertT}">Add missed lap</button></div>`
           :`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} is very short</span><button class="btn sm" data-rmtap="${f.tapId}">Remove that tap</button></div>`).join("")}
         ${possibleDnf?`<div class="flagrow"><span class="pill warn">No finish recorded</span><button class="btn sm" data-dnf="${x.id}">Mark DNF</button><button class="btn sm ghost" data-addfinish="${x.id}">Add finish now</button></div>`:""}
         ${x.dnf?`<div class="flagrow"><button class="btn sm ghost" data-dnf="${x.id}">Undo DNF</button></div>`:""}
-      </td><td class="r t">${row.status==="dnf"||row.status==="dns"?(row.laps||"–"):row.laps}</td><td class="r t">${row.time!=null?fmt(row.time):"–"}</td><td class="r t">${esc(row.gap)}</td></tr>`}).join("")}
+        ${x.dns?`<div class="flagrow"><span class="pill">Did not start</span>${x.ignored?`<span class="small muted">${x.ignored} tap${x.ignored>1?"s":""} ignored</span>`:""}<button class="btn sm ghost" data-dns="${x.id}">Undo DNS</button></div>`
+          :view.lapEdit===x.id?`<div class="flagrow"><span class="pill">Editing laps below</span></div>`:`<div class="flagrow"><button class="btn sm ghost" data-lapedit="${x.id}">Edit laps${riderEditCount(race,x.id)?" (edited)":""}</button><button class="btn sm ghost" data-dns="${x.id}">Mark DNS</button></div>`}
+      </td><td class="r t">${row.status==="dnf"||row.status==="dns"?(row.laps||"–"):row.laps}</td><td class="r t">${row.time!=null?fmt(row.time):"–"}</td><td class="r t">${esc(row.gap)}</td></tr>${view.lapEdit===x.id&&!x.dns?`<tr class="editrow"><td colspan="5">${renderLapEditor(race,x)}</td></tr>`:""}`}).join("")}
     </tbody></table></div></div>` }).join("");
   const pub=race.published;
   return `<div class="stack">
     <div class="banner ${flags?"":"fin"}"><p>${!ended?"The race is still running. Results here update live.":flags?`<b>${flags} thing${flags>1?"s":""} to check</b> before publishing. Highlighted laps are about twice or half the rider's usual lap.`:"<b>No problems spotted.</b> Ready to publish."}</p>
     ${ended?`<button class="btn sm primary" data-act="publish">${pub?"Republish results":"Publish results"}</button>`:""}</div>
     ${pub?`<p class="note">Published ${new Date(pub.at).toLocaleString()}. Changes here go public only when you republish.</p>`:""}
+    ${ended?`<form class="card" id="raceLaps"><div class="spread"><label for="rl-n">Laps the winner raced</label>
+      <span class="row"><input type="number" id="rl-n" min="1" max="99" inputmode="numeric" value="${race.targetLaps||""}" style="width:5em"><button class="btn sm" type="submit">Set</button></span></div>
+      <p class="note">${c.leader&&race.targetLaps&&c.leader.all.length<race.targetLaps?`<b>No rider has ${race.targetLaps} laps recorded</b>, so nobody has a finish. If the race was shorter, set the real number of laps here. `:""}Everyone's finish is their first crossing once the winner has completed this many laps. Fix any bad taps below first.</p></form>`:""}
     ${sec}
     ${ended?`<div class="row"><button class="btn sm ghost" data-act="reopen">Reopen timing</button></div>`:""}
   </div>`;
@@ -707,6 +775,10 @@ document.addEventListener("click",e=>{
   if(t.dataset.delrider){ const id=t.dataset.delrider; arm("del-"+id,()=>{ const s=series[view.seriesId]; const riders={...s.riders}; delete riders[id];
       enqueue("series/"+view.seriesId,()=>db.doc("series/"+view.seriesId).set({...s,riders})); series[view.seriesId]={...s,riders}; render(); }); return }
   if(t.dataset.dnf){ toggleDnf(t.dataset.dnf); return }
+  if(t.dataset.dns){ const race=getRace(view.raceId), id=t.dataset.dns, d=new Set(race.dns||[]); const on=!d.has(id); on?d.add(id):d.delete(id);
+    const f={dns:[...d]}; if(on&&(race.dnf||[]).includes(id)) f.dnf=(race.dnf||[]).filter(r=>r!==id);
+    if(on&&view.lapEdit===id) view.lapEdit=null;
+    setRace(race.id,f); const r=series[race.seriesId].riders[id]; toast(`#${r.num} ${on?"marked DNS":"back in the results"}`); return }
   if(t.dataset.archrace||t.dataset.restorerace){ const rid=t.dataset.archrace||t.dataset.restorerace, a=!!t.dataset.archrace;
     races[rid]={...races[rid],archived:a}; enqueue("races/"+rid,()=>db.doc("races/"+rid).update({archived:a})); toast(a?"Race moved to the archive":"Race restored"); render(); return }
   if(t.dataset.archseries||t.dataset.restoreseries){ const sid=t.dataset.archseries||t.dataset.restoreseries, a=!!t.dataset.archseries;
@@ -725,6 +797,11 @@ document.addEventListener("click",e=>{
   if(t.dataset.addfinish){ const race=getRace(view.raceId), c=compute(race,series[race.seriesId],Date.now()), x=c.R[t.dataset.addfinish];
     const at=Math.max(c.finishAt||0,x.last+DEDUP_MS)+1000; const ed=race.edits||{};
     setRace(race.id,{edits:{removed:ed.removed||[],added:[...(ed.added||[]),{id:"e-"+uid(),r:x.id,t:at}]}}); toast("Finish added"); return }
+  if(t.dataset.lapedit!==undefined){ view.lapEdit=t.dataset.lapedit||null; view.lapTime=null; render();
+    if(view.lapEdit){ const el=document.getElementById("lapedit-"+view.lapEdit); if(el&&el.scrollIntoView)el.scrollIntoView({block:"nearest"}) } return }
+  if(t.dataset.laptime!==undefined){ view.lapTime=t.dataset.laptime||null; view.lapTimeVal=null; render(); const el=$("#lt-val"); if(el){el.focus();el.select()} return }
+  if(t.dataset.lapsplit||t.dataset.lapdel){ const [r,i]=(t.dataset.lapsplit||t.dataset.lapdel).split("|"); view.lapTime=null; lapAction(t.dataset.lapsplit?"split":"delete",r,+i); return }
+  if(t.dataset.lapreset){ const r=t.dataset.lapreset; arm("resetlaps-"+r,()=>{ resetRiderEdits(getRace(view.raceId),r); toast("Laps back to the timekeepers' taps") }); return }
   if(t.dataset.rmtap){ const race=getRace(view.raceId); const ed=race.edits||{};
     setRace(race.id,{edits:{added:ed.added||[],removed:[...(ed.removed||[]),t.dataset.rmtap]}}); toast("Tap removed"); return }
   const act=t.dataset.act; if(!act)return;
@@ -739,7 +816,6 @@ document.addEventListener("click",e=>{
     if(navigator.share) navigator.share({title:"Lapboard timekeeper: "+race.name,text:"Timekeeping link for "+race.name+":",url:u}).catch(()=>{});
     else (navigator.clipboard?navigator.clipboard.writeText(u):Promise.reject()).then(()=>toast("Link copied"),()=>toast("Select the link and copy it")); return }
   if(act==="canceledit"){ view.editRider=null; render(); return }
-  if(act==="navback"){ history.back(); return }
   if(act==="duprace"){ const race=getRace(view.raceId); toast("Duplicating…");
     enqueue("races/new",async()=>{ const rid=await createRace({seriesId:race.seriesId,name:nextName(race.name.replace(/\(copy\)$/,"").trim()),date:new Date().toISOString().slice(0,10),durationMin:race.durationMin||45});
       lives[rid]={...lives[rid],checkedIn:[...(race.checkedIn||[])]}; await db.doc(livePath(rid)).update({checkedIn:[...(race.checkedIn||[])]});
@@ -747,14 +823,14 @@ document.addEventListener("click",e=>{
   if(act==="example"){ toast("Adding example series…"); enqueue("example",async()=>{ const sid=await loadExample(); toast("Example series added"); go({screen:"series",seriesId:sid,tab:"races"}) }); return }
   if(act==="rekey"){ arm("rekey",()=>rekey(race.id)); return }
   if(act==="start") arm("start",()=>{ setRace(race.id,{startAt:Date.now(),status:"running",targetLaps:null}); requestWake(); toast("Race started") });
-  else if(act==="end") arm("end",()=>{ setRace(race.id,{status:"done"}); go({tab:admin()?"review":"timing"}) });
+  else if(act==="end") arm("end",()=>{ setRace(race.id,{status:"done",endedAt:Date.now()}); go({tab:admin()?"review":"timing"}) });
   else if(act==="bellnow") arm("bellnow",()=>{ const c=compute(race,series[race.seriesId],Date.now()); setRace(race.id,{targetLaps:(c.leader?c.leader.laps:0)+1,lapsFrom:null}); });
   else if(act==="lapsplus") setRace(race.id,{targetLaps:race.targetLaps+1});
   else if(act==="lapsminus"){ const c=compute(race,series[race.seriesId],Date.now()); if(race.targetLaps-1>(c.leader?c.leader.laps:0)+1) setRace(race.id,{targetLaps:race.targetLaps-1}); }
   else if(act==="dnfmode"){ dnfMode=!dnfMode; render(); }
-  else if(act==="reopen") { setRace(race.id,{status:"running"}); go({tab:"timing"}) }
+  else if(act==="reopen") { setRace(race.id,{status:"running",endedAt:null}); go({tab:"timing"}) }
   else if(act==="reset") arm("reset",async()=>{ const ids=Object.keys(tapDocs); ownTaps=[]; ownRemoved=new Set();
-      setRace(race.id,{startAt:null,status:"setup",targetLaps:null,lapsFrom:null,dnf:[],...(admin()?{edits:{added:[],removed:[]}}:{})});
+      setRace(race.id,{startAt:null,status:"setup",targetLaps:null,lapsFrom:null,dnf:[],dns:[],endedAt:null,...(admin()?{edits:{added:[],removed:[]}}:{})});
       for(const id of ids) await enqueue("taps/"+id,()=>db.doc(livePath(race.id)+"/taps/"+id).delete()); toast("Race reset") });
   else if(act==="checkall"){ const s=series[race.seriesId]; setRace(race.id,{checkedIn:Object.keys(s.riders||{})}) }
   else if(act==="checknone") setRace(race.id,{checkedIn:[]});
@@ -768,7 +844,7 @@ document.addEventListener("change",e=>{
   if(t.dataset.check){ const race=getRace(view.raceId); const set=new Set(race.checkedIn||[]); t.checked?set.add(t.dataset.check):set.delete(t.dataset.check); setRace(race.id,{checkedIn:[...set]}) }
   if(t.id==="dur"){ const v=Math.max(5,Math.min(180,+t.value||45)); setRace(view.raceId,{durationMin:v}) }
 });
-document.addEventListener("input",e=>{ if(e.target.id==="ci-search"||e.target.id==="find-q"){ const id=e.target.id; view[id==="find-q"?"fq":"q"]=e.target.value; const pos=e.target.selectionStart; render(); const el=$("#"+id); el.focus(); try{el.setSelectionRange(pos,pos)}catch(_){} } });
+document.addEventListener("input",e=>{ if(e.target.id==="lt-val") view.lapTimeVal=e.target.value; if(e.target.id==="ci-search"||e.target.id==="find-q"){ const id=e.target.id; view[id==="find-q"?"fq":"q"]=e.target.value; const pos=e.target.selectionStart; render(); const el=$("#"+id); el.focus(); try{el.setSelectionRange(pos,pos)}catch(_){} } });
 document.addEventListener("submit",async e=>{
   e.preventDefault(); const f=e.target;
   if(f.id==="newSeries"||f.id==="copySeries"){ const copy=f.id==="copySeries";
@@ -779,6 +855,10 @@ document.addEventListener("submit",async e=>{
     if(from) toast(`${Object.keys(riders).length} riders copied with their numbers`);
     if(kind==="oneday") await enqueue("races/new",()=>createRace({seriesId:ref.id,name,date:new Date().toISOString().slice(0,10),durationMin:45}));
     go({screen:"series",seriesId:ref.id,tab:"riders"}); }
+  if(f.id==="raceLaps"){ const n=Math.round(+$("#rl-n").value); if(!(n>=1&&n<=99)){ toast("Type the number of laps, like 8"); return }
+    setRace(view.raceId,{targetLaps:n}); toast(`Race set to ${n} laps`); return }
+  if(f.id==="lapTime"){ if(lapAction("time",f.dataset.rid,+f.dataset.i,$("#lt-val").value)){ view.lapTime=null; render() } return }
+  if(f.id==="addCrossing"){ if(addCrossing(f.dataset.rid,$("#ac-val").value)) render(); return }
   if(f.id==="newRace"){ let rid=null;
     await enqueue("races/new",async()=>{ rid=await createRace({seriesId:view.seriesId,name:$("#nr-name").value.trim()||"Race",date:$("#nr-date").value,durationMin:+$("#nr-min").value||45}) });
     if(rid) go({screen:"race",raceId:rid,tab:"checkin"}); }

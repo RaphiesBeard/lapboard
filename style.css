@@ -115,6 +115,7 @@ td.r,th.r{text-align:right;white-space:nowrap}
 td.pos{font-family:var(--display);font-weight:800;font-size:20px;width:36px}
 .laps{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px}
 .laps span{font-size:11px;background:var(--sunk);border-radius:4px;padding:0 5px;font-variant-numeric:tabular-nums}
+.laps span .ln{font-weight:700;color:var(--muted,inherit);margin-right:4px;padding-right:4px;border-right:1px solid var(--line)}
 .laps span.flag{background:var(--over);font-weight:700}
 .laps span.short{background:var(--due);font-weight:700}
 .flagrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px;font-size:13px}
@@ -132,3 +133,12 @@ body{padding-top:env(safe-area-inset-top,0px);margin:0}
 .help b{font-weight:600}
 .crumbs .navback{background:var(--fg);color:var(--bg);border-radius:99px;padding:2px 10px;font-weight:700}
 .crumbs .sep{color:var(--line)}
+.lapedit{margin-top:8px;padding:8px;border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;gap:6px;background:var(--bg)}
+.lapedit .note{margin:0}
+.lerow{display:flex;flex-direction:row;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:4px 10px;padding:6px 0;border-bottom:1px dashed var(--line)}
+.lerow .lehead{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:14px}
+.lerow .t{font-variant-numeric:tabular-nums}
+.lerow.edited .lehead b::after{content:" ✎";font-weight:400}
+.lerow.after{opacity:.7}
+.editrow td{background:var(--bg)}
+.lerow.flagged .lehead .t{background:var(--over);border-radius:4px;padding:0 4px;font-weight:700}
