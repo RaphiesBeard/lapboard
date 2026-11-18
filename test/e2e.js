@@ -21,7 +21,7 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok((await p.textContent('h1')).includes('Race results'),'browser back returns to public home');
   await p.goForward();await p.waitForTimeout(150);
   ok((await p.textContent('h1')).includes('Biscuit Cup'),'browser forward returns to series');
-  await p.click('[data-act=navback]');await p.waitForTimeout(150);
+  await p.click('.navback');await p.waitForTimeout(150);
   ok((await p.textContent('h1')).includes('Race results'),'on-screen back button works');
   ok(!(await p.isVisible('text=Settings')),'no settings tab for public');
   ok(p.errs.length===0,'public: no errors '+p.errs);
@@ -164,6 +164,83 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok(await p.isVisible('#grid'),'back from help returns to timing: '+(await p.textContent('#app')).slice(0,120));
   p=await page('#/t/bc-r2/wrongkey');await p.waitForTimeout(300);
   ok(await p.isVisible("text=This link isn't valid any more"),'wrong key shows invalid link');
+  // organiser lap editing, DNS, race laps, clock and back button
+  p=await page('#/admin');await p.click('text=Sign in with Google');await p.waitForTimeout(300);
+  await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);await p.click('text=Round 1 (example)');await p.waitForTimeout(200);
+  await p.click('[data-tab=review]');await p.waitForTimeout(100);
+  ok(await p.isVisible('text=3 things to check'),'lap edit: starts with 3 flags');
+  ok(await p.evaluate(()=>!!document.querySelector('.laps .ln')),'lap labels separate lap number from time');
+  const ed=()=>p.evaluate(()=>window.__store.get('races/bc-r1').edits);
+  const lapsOf=num=>p.evaluate(n=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent==String(n)});return tr?[...tr.querySelectorAll('.laps span')].map(s=>s.textContent):null},num);
+  // ex05 (#5): lap 5 is double. Split it by hand.
+  await p.click('[data-lapedit=ex05]');await p.waitForTimeout(80);
+  ok(await p.isVisible('#lapedit-ex05'),'lap editor opens');
+  await p.click('[data-lapsplit="ex05|4"]');await p.waitForTimeout(150);
+  let e1=await ed();
+  ok(e1.added.length===1&&e1.added[0].r==='ex05','split adds one crossing '+JSON.stringify(e1));
+  ok(await p.isVisible('text=2 things to check'),'split clears the missed-lap flag');
+  let l5=await lapsOf(5);
+  ok(l5&&l5.length===8,'rider 5 now has 8 laps '+JSON.stringify(l5));
+  // change the split crossing's time to 30:00
+  await p.click('[data-laptime="ex05|4"]');await p.fill('#lt-val','30:00');await p.click('#lapTime button[type=submit]');await p.waitForTimeout(150);
+  e1=await ed();
+  ok(e1.added.length===1&&e1.added[0].t===1791108000000+1800000,'change time replaces the added crossing '+JSON.stringify(e1.added));
+  await p.click('[data-laptime="ex05|4"]');await p.fill('#lt-val','99:00');await p.click('#lapTime button[type=submit]');await p.waitForTimeout(100);
+  ok(await p.isVisible('text=Pick a time between'),'out-of-order time refused');
+  await p.click('[data-laptime=""]');await p.waitForTimeout(50);
+  // delete a timekeeper crossing: lap 2 of rider 5 merges with lap 3
+  await p.click('[data-lapdel="ex05|1"]');await p.waitForTimeout(150);
+  e1=await ed();l5=await lapsOf(5);
+  ok(e1.removed.includes('seed-'+0)===false&&e1.removed.length===1&&l5.length===7,'delete removes the original tap and merges laps '+JSON.stringify(e1.removed)+' '+l5.length);
+  // add a crossing by typing a time
+  await p.fill('#ac-val','10:00');await p.click('#addCrossing button');await p.waitForTimeout(150);
+  l5=await lapsOf(5);ok(l5.length===8,'add a crossing by race time');
+  await p.fill('#ac-val','nonsense');await p.click('#addCrossing button');await p.waitForTimeout(80);
+  ok(await p.isVisible('text=Type the race time'),'bad time refused');
+  // undo all changes to the rider
+  await p.click('[data-lapreset=ex05]');await p.click('[data-lapreset=ex05]');await p.waitForTimeout(150);
+  e1=await ed();l5=await lapsOf(5);
+  ok(e1.added.length===0&&e1.removed.length===0&&l5.length===7,'undo all restores the timekeepers\' taps '+JSON.stringify(e1));
+  ok(await p.isVisible('text=3 things to check'),'flags back after undo');
+  // rankings recompute: winner of men's race is #2 (ex02)? check leader changes when we delete a winner crossing
+  const firstM=()=>p.evaluate(()=>{const c=[...document.querySelectorAll('.card')].find(c=>c.querySelector('h2')&&c.querySelector('h2').textContent==='Men');return c.querySelector('tbody tr .plate-sm').textContent});
+  const w0=await firstM();
+  const wid=await p.evaluate(n=>Object.entries(window.__store.get('series/biscuit-cup-example').riders).find(([k,r])=>String(r.num)===n)[0],w0);
+  await p.click(`[data-lapedit=${wid}]`);await p.click(`[data-lapdel="${wid}|0"]`);await p.waitForTimeout(150);
+  ok(await firstM()!==w0,'deleting a winner\'s lap re-ranks the race');
+  await p.click(`[data-lapreset=${wid}]`);await p.click(`[data-lapreset=${wid}]`);await p.waitForTimeout(150);
+  ok(await firstM()===w0,'winner restored after undo');
+  // DNS
+  await p.click('[data-dns=ex12]');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>window.__store.get('races/bc-r1/live/k1').dns.includes('ex12')),'DNS saved to the race');
+  ok(await p.isVisible('text=Did not start')&&await p.isVisible('text=10 taps ignored'),'DNS rider shown with ignored taps');
+  ok(await p.isVisible('text=2 things to check'),'DNS rider no longer flagged');
+  await p.click('[data-dns=ex12]');await p.waitForTimeout(150);
+  ok(await p.isVisible('text=3 things to check'),'undo DNS');
+  // race laps
+  await p.fill('#rl-n','8');await p.click('#raceLaps button');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>window.__store.get('races/bc-r1/live/k1').targetLaps===8),'race laps set directly');
+  ok(await p.evaluate(()=>{const c=[...document.querySelectorAll('.card')].find(c=>c.querySelector('h2')&&c.querySelector('h2').textContent==='Men');return c.querySelector('tbody tr td:nth-child(3)').textContent.trim()==='8'}),'winner now on 8 laps');
+  await p.fill('#rl-n','10');await p.click('#raceLaps button');await p.waitForTimeout(150);
+  // clock stops on an ended race
+  await p.click('[data-tab=timing]');await p.waitForTimeout(1300);
+  const ck1=await p.textContent('#clock');await p.waitForTimeout(1600);const ck2=await p.textContent('#clock');
+  ok(ck1===ck2&&await p.isVisible("text=Winner's time"),'clock stopped at the winner\'s time '+ck1+' '+ck2);
+  // back goes up one level, not to the previous page
+  await p.click('.navback');await p.waitForTimeout(150);
+  ok((await p.textContent('h1')).includes('Biscuit Cup'),'back from race goes to its series');
+  await p.click('.navback');await p.waitForTimeout(150);
+  ok((await p.textContent('h1')).includes('Your series'),'back from series goes home');
+  ok(!(await p.isVisible('.navback')),'no back button on home');
+  ok(p.errs.length===0,'lap editing: no errors '+p.errs);
+  // a stray tap that makes the leader's lap 2 far too short must not set a silly lap count
+  p=await page('#/t/bc-r2/k2',()=>{window.__seedHook=1});
+  await p.evaluate(()=>{const now=Date.now(),st=now-7*60000;window.__store.set('races/bc-r2/live/k2',{...window.__store.get('races/bc-r2/live/k2'),status:'running',startAt:st,targetLaps:null,lapsFrom:null});
+    window.__store.set('races/bc-r2/live/k2/taps/other',{device:'other',taps:[{id:'x1',r:'ex01',t:st+300000},{id:'x2',r:'ex01',t:st+390000}]});
+    window.__MOCK_BACKEND.db.doc('races/bc-r2').update({})});
+  await p.waitForTimeout(2500);
+  const tl=await p.evaluate(()=>window.__store.get('races/bc-r2/live/k2').targetLaps);
+  ok(tl>=8&&tl<=10,'short lap 2 falls back to lap 1 for the lap count: '+tl);
   // public results with published data
   await p.close();
   p=await b.newPage({viewport:{width:400,height:860}});p.errs=[];p.on('pageerror',e=>p.errs.push(e.message));
