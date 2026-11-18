@@ -173,7 +173,9 @@ function renderLapEditor(race,x){
   </div>` }
 function flagsFor(x){
   const out=[]; const lt=x.lapTimes; if(lt.length<3)return out;
-  const med=median(lt.slice(1));
+  // Compare with the rider's normal lap. The median alone fails when several laps are doubled
+  // (e.g. 6:46, 12:52, 12:40, 6:27), so also use the second-fastest lap, which one stray short lap can't drag down.
+  const sorted=[...lt].sort((a,b)=>a-b), med=Math.min(median(lt.slice(1)),sorted[1]);
   lt.forEach((v,i)=>{ const ref=i===0?med*1.1:med;
     if(v>ref*1.65) out.push({type:"missed",lap:i,at:(i?x.cr[i-1].t:null),insertT:Math.round((i?x.cr[i-1].t:x.cr[0].t-v)+v/2)});
     else if(i>0&&v<med*0.5) out.push({type:"short",lap:i,tapId:x.cr[i].id});
@@ -191,8 +193,12 @@ function rankings(race,s,now){
     const dns=xs.filter(x=>x.dns||(!x.dnf&&!x.fin&&x.laps===0)).sort((a,b)=>a.rider.num-b.rider.num);
     const win=fin[0]||run[0];
     const rows=[]; let pos=0;
-    for(const x of [...fin,...run]){ pos++;
+    // Once the race is over, a rider with no recorded finish is placed by laps and their last crossing
+    // among the finishers (not below all of them), and shown without a time.
+    const placed=done?[...fin,...run].sort((a,b)=>b.laps-a.laps||(a.fin?a.finishT:a.last)-(b.fin?b.finishT:b.last)):[...fin,...run];
+    for(const x of placed){ pos++;
       const behind=win?win.laps-x.laps:0; const t=(x.fin?x.finishT:x.last)-c.start;
+      if(done&&!x.fin&&c.finishAt!=null){ rows.push({x,pos:String(pos),status:"nofin",laps:x.laps,behind,time:null,gap:behind?`−${behind} lap${behind>1?"s":""}`:""}); continue }
       const gap=!win||x===win?"":behind?`−${behind} lap${behind>1?"s":""}`:"+"+fmt(t-((win.fin?win.finishT:win.last)-c.start));
       rows.push({x,pos:String(pos),status:x.fin?"fin":(done?"nofin":"run"),laps:x.laps,behind,time:t,gap});
     }
@@ -531,7 +537,7 @@ function renderHelp(){
     step("Check-in and timing","You can do these yourself or leave them to your timekeepers. The steps are the same: see the Timekeepers guide."),
     step("New rider on the day","On the Check-in tab, use <i>New rider today</i>. They are added to the series and checked in. Timekeepers can do this too, and their new riders appear in the series as soon as you open Lapboard."),
   ])+sec("After the race",[
-    step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i>: tap <i>Mark DNF</i> or <i>Add finish now</i>."),
+    step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i> (they stopped before the winner finished): they are placed at their last crossing with no time. If the finish tap was missed, type when they finished (a guess is filled in) and tap <i>Add finish</i>. If they dropped out, tap <i>Mark DNF</i>."),
     step("Fix any lap yourself","Tap <i>Edit laps</i> under a rider. <i>Split</i> turns one long lap into two, <i>Delete</i> removes a crossing (joining it to the next lap), and <i>Change time</i> moves a crossing. Type a missing one under <i>Add a crossing</i>, as race time like 23:15. Positions, laps and gaps update straight away. The original taps are kept, so <i>Undo all changes</i> puts that rider back."),
     step("Someone checked in by mistake?","Tap <i>Mark DNS</i> under their name on the Review tab. Any taps on their number are ignored and they show as DNS. If the lap count looks wrong (for example a stray tap made it 30 laps), type the real number in <i>Laps the winner raced</i>."),
     step("Publish","Tap <i>Publish results</i>. The race appears on the public results page and the series standings update. If you change anything later, tap <i>Republish results</i>."),
@@ -656,7 +662,10 @@ function renderReview(race,s){
         ${x.lapTimes.length?`<div class="laps">${x.lapTimes.map((v,i)=>`<span class="${missedLaps.has(i)?"flag":shortLaps.has(i)?"short":""}"><b class="ln">L${i+1}</b>${fmt(v)}</span>`).join("")}</div>`:""}
         ${fl.map(f=>f.type==="missed"?`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} looks like 2 laps</span><button class="btn sm" data-addtap="${x.id}|${f.insertT}">Add missed lap</button></div>`
           :`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} is very short</span><button class="btn sm" data-rmtap="${f.tapId}">Remove that tap</button></div>`).join("")}
-        ${possibleDnf?`<div class="flagrow"><span class="pill warn">No finish recorded</span><button class="btn sm" data-dnf="${x.id}">Mark DNF</button><button class="btn sm ghost" data-addfinish="${x.id}">Add finish now</button></div>`:""}
+        ${possibleDnf?`<div class="flagrow"><span class="pill warn">No finish recorded</span><span class="small muted">Placed at their last crossing (${fmt(x.last-race.startAt)}), with no time</span></div>
+          <form class="flagrow" id="addFinish" data-rid="${x.id}"><label class="small" for="af-${x.id}">Finished at</label><input type="text" id="af-${x.id}" inputmode="numeric" value="${fmt(Math.max((c.finishAt||0)+1000,x.last+(x.avg||0))-race.startAt)}" style="width:6em" aria-label="Estimated finish, race time"><button class="btn sm" type="submit">Add finish</button></form>
+          <div class="flagrow"><button class="btn sm ghost" data-dnf="${x.id}">Mark DNF</button></div>
+          <p class="note" style="margin:4px 0 0">If they crossed the line but the tap was missed, add their finish. The time filled in is a guess (last crossing plus a usual lap): if someone passed them on the last lap, make it just after that rider's finish.</p>`:""}
         ${x.dnf?`<div class="flagrow"><button class="btn sm ghost" data-dnf="${x.id}">Undo DNF</button></div>`:""}
         ${x.dns?`<div class="flagrow"><span class="pill">Did not start</span>${x.ignored?`<span class="small muted">${x.ignored} tap${x.ignored>1?"s":""} ignored</span>`:""}<button class="btn sm ghost" data-dns="${x.id}">Undo DNS</button></div>`
           :view.lapEdit===x.id?`<div class="flagrow"><span class="pill">Editing laps below</span></div>`:`<div class="flagrow"><button class="btn sm ghost" data-lapedit="${x.id}">Edit laps${riderEditCount(race,x.id)?" (edited)":""}</button><button class="btn sm ghost" data-dns="${x.id}">Mark DNS</button></div>`}
@@ -794,9 +803,6 @@ document.addEventListener("click",e=>{
       try{ await deleteRace(rid); toast(`${n} deleted for good`) }catch(e){ console.error(e); toast("Couldn't delete the race. Try again") } render() }); return }
   if(t.dataset.addtap){ const [r,tt]=t.dataset.addtap.split("|"); const race=getRace(view.raceId); const ed=race.edits||{};
     setRace(race.id,{edits:{removed:ed.removed||[],added:[...(ed.added||[]),{id:"e-"+uid(),r,t:+tt}]}}); toast("Lap added"); return }
-  if(t.dataset.addfinish){ const race=getRace(view.raceId), c=compute(race,series[race.seriesId],Date.now()), x=c.R[t.dataset.addfinish];
-    const at=Math.max(c.finishAt||0,x.last+DEDUP_MS)+1000; const ed=race.edits||{};
-    setRace(race.id,{edits:{removed:ed.removed||[],added:[...(ed.added||[]),{id:"e-"+uid(),r:x.id,t:at}]}}); toast("Finish added"); return }
   if(t.dataset.lapedit!==undefined){ view.lapEdit=t.dataset.lapedit||null; view.lapTime=null; render();
     if(view.lapEdit){ const el=document.getElementById("lapedit-"+view.lapEdit); if(el&&el.scrollIntoView)el.scrollIntoView({block:"nearest"}) } return }
   if(t.dataset.laptime!==undefined){ view.lapTime=t.dataset.laptime||null; view.lapTimeVal=null; render(); const el=$("#lt-val"); if(el){el.focus();el.select()} return }
@@ -858,6 +864,7 @@ document.addEventListener("submit",async e=>{
   if(f.id==="raceLaps"){ const n=Math.round(+$("#rl-n").value); if(!(n>=1&&n<=99)){ toast("Type the number of laps, like 8"); return }
     setRace(view.raceId,{targetLaps:n}); toast(`Race set to ${n} laps`); return }
   if(f.id==="lapTime"){ if(lapAction("time",f.dataset.rid,+f.dataset.i,$("#lt-val").value)){ view.lapTime=null; render() } return }
+  if(f.id==="addFinish"){ if(addCrossing(f.dataset.rid,$("#af-"+f.dataset.rid).value)) render(); return }
   if(f.id==="addCrossing"){ if(addCrossing(f.dataset.rid,$("#ac-val").value)) render(); return }
   if(f.id==="newRace"){ let rid=null;
     await enqueue("races/new",async()=>{ rid=await createRace({seriesId:view.seriesId,name:$("#nr-name").value.trim()||"Race",date:$("#nr-date").value,durationMin:+$("#nr-min").value||45}) });

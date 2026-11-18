@@ -233,6 +233,23 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok((await p.textContent('h1')).includes('Your series'),'back from series goes home');
   ok(!(await p.isVisible('.navback')),'no back button on home');
   ok(p.errs.length===0,'lap editing: no errors '+p.errs);
+  // riders who stopped before the winner finished; doubled laps that outnumber normal ones
+  p=await page('#/admin');await p.click('text=Sign in with Google');await p.waitForTimeout(300);
+  await p.evaluate(()=>{const st=1791108000000,m=60000;window.__MOCK_BACKEND.db.doc('races/bc-r1/live/k1/taps/jt').set({device:'jt',taps:[[6.77],[19.63],[32.3],[38.75]].map(([v],i)=>({id:'jt'+i,r:'ex30',t:st+v*m}))})});
+  await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);await p.click('text=Round 1 (example)');await p.waitForTimeout(200);
+  await p.click('[data-tab=review]');await p.waitForTimeout(150);
+  const missed=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='40'});return tr?tr.querySelectorAll('.laps span.flag').length:-1});
+  ok(missed===2,'two doubled laps out of four are both flagged: '+missed);
+  const row=n=>p.evaluate(n=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent==String(n)});return {pos:tr.querySelector('.pos').textContent,laps:tr.querySelector('td:nth-child(3)').textContent.trim(),time:tr.querySelector('td:nth-child(4)').textContent.trim(),gap:tr.querySelector('td:nth-child(5)').textContent.trim(),nofin:tr.textContent.includes('No finish recorded')}},n);
+  const r17=await row(17), r39=await row(40);
+  ok(/^\d+$/.test(r17.pos)&&r17.laps==='3'&&r17.time==='–'&&r17.gap==='−7 laps'&&r17.nofin,'rider with no finish is placed at last crossing with no time '+JSON.stringify(r17));
+  ok(+r39.pos<+r17.pos,'no-finish riders ordered by laps '+r39.pos+' '+r17.pos);
+  const est=await p.inputValue('#af-ex17');
+  await p.click('#addFinish[data-rid=ex17] button');await p.waitForTimeout(150);
+  const r17b=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='17'});return {pos:tr.querySelector('.pos').textContent,laps:tr.querySelector('td:nth-child(3)').textContent.trim(),nofin:tr.textContent.includes('No finish recorded')}});
+  ok(/^\d+$/.test(r17b.pos)&&r17b.laps==='4'&&!r17b.nofin,'add estimated finish ('+est+') gives one more lap and a finish '+JSON.stringify(r17b));
+  await p.click('[data-lapedit=ex17]');await p.click('[data-lapreset=ex17]');await p.click('[data-lapreset=ex17]');await p.waitForTimeout(150);
+  ok(p.errs.length===0,'no-finish riders: no errors '+p.errs);
   // a stray tap that makes the leader's lap 2 far too short must not set a silly lap count
   p=await page('#/t/bc-r2/k2',()=>{window.__seedHook=1});
   await p.evaluate(()=>{const now=Date.now(),st=now-7*60000;window.__store.set('races/bc-r2/live/k2',{...window.__store.get('races/bc-r2/live/k2'),status:'running',startAt:st,targetLaps:null,lapsFrom:null});
