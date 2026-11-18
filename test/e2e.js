@@ -51,10 +51,10 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok(await p.evaluate(()=>{const r=window.__store.get('series/biscuit-cup-example').riders.ex01;return r.name==='Ada Kettle-Renamed'&&r.num===99}),'rider can be edited');
   await p.click('[data-tab=races]');
   await p.click('text=Round 1 (example)');await p.waitForTimeout(200);
-  ok(await p.isVisible('text=3 things to check'),'review flags 3 problems');
+  ok(await p.isVisible('text=2 things to check'),'review flags 2 problems');
   await p.click('text=Add missed lap');await p.waitForTimeout(80);
   await p.click('text=Remove that tap');await p.waitForTimeout(80);
-  await p.click('[data-dnf]');await p.waitForTimeout(80);
+  
   ok(await p.isVisible('text=No problems spotted'),'flags cleared after fixes');
   await p.click('[data-act=publish]');await p.waitForTimeout(200);
   const pub=await p.evaluate(()=>window.__store.get('races/bc-r1').published);
@@ -98,7 +98,7 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   await p.click('[data-act=example]');await p.waitForTimeout(600);
   ok(await p.isVisible('text=Round 1 (example)')&&await p.isVisible('text=Practice round'),'example series loaded');
   await p.click('text=Round 1 (example)');await p.waitForTimeout(300);await p.click('[data-tab=review]');await p.waitForTimeout(150);
-  ok(await p.isVisible('text=3 things to check'),'example race has the 3 practice problems');
+  ok(await p.isVisible('text=2 things to check'),'example race has the 2 practice problems');
   ok(p.errs.length===0,'admin: no errors '+p.errs);
   // password sign-in flow on a fresh page
   p=await page('#/admin');
@@ -168,7 +168,7 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   p=await page('#/admin');await p.click('text=Sign in with Google');await p.waitForTimeout(300);
   await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);await p.click('text=Round 1 (example)');await p.waitForTimeout(200);
   await p.click('[data-tab=review]');await p.waitForTimeout(100);
-  ok(await p.isVisible('text=3 things to check'),'lap edit: starts with 3 flags');
+  ok(await p.isVisible('text=2 things to check'),'lap edit: starts with 3 flags');
   ok(await p.evaluate(()=>!!document.querySelector('.laps .ln')),'lap labels separate lap number from time');
   const ed=()=>p.evaluate(()=>window.__store.get('races/bc-r1').edits);
   const lapsOf=num=>p.evaluate(n=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent==String(n)});return tr?[...tr.querySelectorAll('.laps span')].map(s=>s.textContent):null},num);
@@ -178,7 +178,7 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   await p.click('[data-lapsplit="ex05|4"]');await p.waitForTimeout(150);
   let e1=await ed();
   ok(e1.added.length===1&&e1.added[0].r==='ex05','split adds one crossing '+JSON.stringify(e1));
-  ok(await p.isVisible('text=2 things to check'),'split clears the missed-lap flag');
+  ok(await p.isVisible('text=1 thing to check'),'split clears the missed-lap flag');
   let l5=await lapsOf(5);
   ok(l5&&l5.length===8,'rider 5 now has 8 laps '+JSON.stringify(l5));
   // change the split crossing's time to 30:00
@@ -201,7 +201,7 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   await p.click('[data-lapreset=ex05]');await p.click('[data-lapreset=ex05]');await p.waitForTimeout(150);
   e1=await ed();l5=await lapsOf(5);
   ok(e1.added.length===0&&e1.removed.length===0&&l5.length===7,'undo all restores the timekeepers\' taps '+JSON.stringify(e1));
-  ok(await p.isVisible('text=3 things to check'),'flags back after undo');
+  ok(await p.isVisible('text=2 things to check'),'flags back after undo');
   // rankings recompute: winner of men's race is #2 (ex02)? check leader changes when we delete a winner crossing
   const firstM=()=>p.evaluate(()=>{const c=[...document.querySelectorAll('.card')].find(c=>c.querySelector('h2')&&c.querySelector('h2').textContent==='Men');return c.querySelector('tbody tr .plate-sm').textContent});
   const w0=await firstM();
@@ -214,9 +214,9 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   await p.click('[data-dns=ex12]');await p.waitForTimeout(150);
   ok(await p.evaluate(()=>window.__store.get('races/bc-r1/live/k1').dns.includes('ex12')),'DNS saved to the race');
   ok(await p.isVisible('text=Did not start')&&await p.isVisible('text=10 taps ignored'),'DNS rider shown with ignored taps');
-  ok(await p.isVisible('text=2 things to check'),'DNS rider no longer flagged');
+  ok(await p.isVisible('text=1 thing to check'),'DNS rider no longer flagged');
   await p.click('[data-dns=ex12]');await p.waitForTimeout(150);
-  ok(await p.isVisible('text=3 things to check'),'undo DNS');
+  ok(await p.isVisible('text=2 things to check'),'undo DNS');
   // race laps
   await p.fill('#rl-n','8');await p.click('#raceLaps button');await p.waitForTimeout(150);
   ok(await p.evaluate(()=>window.__store.get('races/bc-r1/live/k1').targetLaps===8),'race laps set directly');
@@ -240,15 +240,16 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   await p.click('[data-tab=review]');await p.waitForTimeout(150);
   const missed=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='40'});return tr?tr.querySelectorAll('.laps span.flag').length:-1});
   ok(missed===2,'two doubled laps out of four are both flagged: '+missed);
-  const row=n=>p.evaluate(n=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent==String(n)});return {pos:tr.querySelector('.pos').textContent,laps:tr.querySelector('td:nth-child(3)').textContent.trim(),time:tr.querySelector('td:nth-child(4)').textContent.trim(),gap:tr.querySelector('td:nth-child(5)').textContent.trim(),nofin:tr.textContent.includes('No finish recorded')}},n);
+  const row=n=>p.evaluate(n=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent==String(n)});return {pos:tr.querySelector('.pos').textContent,laps:tr.querySelector('td:nth-child(3)').textContent.trim(),time:tr.querySelector('td:nth-child(4)').textContent.trim(),gap:tr.querySelector('td:nth-child(5)').textContent.trim(),nofin:tr.textContent.includes('Finished at last crossing')}},n);
   const r17=await row(17), r39=await row(40);
-  ok(/^\d+$/.test(r17.pos)&&r17.laps==='3'&&r17.time==='–'&&r17.gap==='−7 laps'&&r17.nofin,'rider with no finish is placed at last crossing with no time '+JSON.stringify(r17));
+  ok(/^\d+$/.test(r17.pos)&&r17.laps==='3'&&r17.time==='17:40'&&r17.gap==='−7 laps'&&r17.nofin,'rider with no finish is placed at last crossing with that time '+JSON.stringify(r17));
   ok(+r39.pos<+r17.pos,'no-finish riders ordered by laps '+r39.pos+' '+r17.pos);
-  const est=await p.inputValue('#af-ex17');
-  await p.click('#addFinish[data-rid=ex17] button');await p.waitForTimeout(150);
-  const r17b=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='17'});return {pos:tr.querySelector('.pos').textContent,laps:tr.querySelector('td:nth-child(3)').textContent.trim(),nofin:tr.textContent.includes('No finish recorded')}});
-  ok(/^\d+$/.test(r17b.pos)&&r17b.laps==='4'&&!r17b.nofin,'add estimated finish ('+est+') gives one more lap and a finish '+JSON.stringify(r17b));
-  await p.click('[data-lapedit=ex17]');await p.click('[data-lapreset=ex17]');await p.click('[data-lapreset=ex17]');await p.waitForTimeout(150);
+  await p.click('[data-lapedit=ex17]');await p.waitForTimeout(80);const est=await p.inputValue('#ac-val');
+  await p.click('#addCrossing button');await p.waitForTimeout(150);
+  const r17b=await row(17);
+  ok(/^\d+$/.test(r17b.pos)&&r17b.laps==='4'&&!r17b.nofin,'add estimated finish ('+est+') in Edit laps gives one more lap and a finish '+JSON.stringify(r17b));
+  ok(await p.isVisible('#lapedit-ex17 [data-dnf=ex17]'),'Mark DNF available in Edit laps');
+  await p.click('[data-lapreset=ex17]');await p.click('[data-lapreset=ex17]');await p.waitForTimeout(150);
   ok(p.errs.length===0,'no-finish riders: no errors '+p.errs);
   // a stray tap that makes the leader's lap 2 far too short must not set a silly lap count
   p=await page('#/t/bc-r2/k2',()=>{window.__seedHook=1});
