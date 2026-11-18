@@ -536,7 +536,7 @@ function renderHelp(){
     step("Check-in and timing","You can do these yourself or leave them to your timekeepers. The steps are the same: see the Timekeepers guide."),
     step("New rider on the day","On the Check-in tab, use <i>New rider today</i>. They are added to the series and checked in. Timekeepers can do this too, and their new riders appear in the series as soon as you open Lapboard."),
   ])+sec("After the race",[
-    step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i> (they stopped before the winner finished): tap <i>Finish at last crossing</i> to place them by laps and time, or <i>Mark DNF</i>."),
+    step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i> (they stopped before the winner finished): type when they finished (a guess is filled in) and tap <i>Add finish</i>, or tap <i>Stopped at last crossing</i> if they stopped early, or <i>Mark DNF</i>."),
     step("Fix any lap yourself","Tap <i>Edit laps</i> under a rider. <i>Split</i> turns one long lap into two, <i>Delete</i> removes a crossing (joining it to the next lap), and <i>Change time</i> moves a crossing. Type a missing one under <i>Add a crossing</i>, as race time like 23:15. Positions, laps and gaps update straight away. The original taps are kept, so <i>Undo all changes</i> puts that rider back."),
     step("Someone checked in by mistake?","Tap <i>Mark DNS</i> under their name on the Review tab. Any taps on their number are ignored and they show as DNS. If the lap count looks wrong (for example a stray tap made it 30 laps), type the real number in <i>Laps the winner raced</i>."),
     step("Publish","Tap <i>Publish results</i>. The race appears on the public results page and the series standings update. If you change anything later, tap <i>Republish results</i>."),
@@ -661,9 +661,12 @@ function renderReview(race,s){
         ${x.lapTimes.length?`<div class="laps">${x.lapTimes.map((v,i)=>`<span class="${missedLaps.has(i)?"flag":shortLaps.has(i)?"short":""}"><b class="ln">L${i+1}</b>${fmt(v)}</span>`).join("")}</div>`:""}
         ${fl.map(f=>f.type==="missed"?`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} looks like 2 laps</span><button class="btn sm" data-addtap="${x.id}|${f.insertT}">Add missed lap</button></div>`
           :`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} is very short</span><button class="btn sm" data-rmtap="${f.tapId}">Remove that tap</button></div>`).join("")}
-        ${possibleDnf?`<div class="flagrow"><span class="pill warn">No finish recorded</span><button class="btn sm" data-dnf="${x.id}">Mark DNF</button><button class="btn sm" data-finishlast="${x.id}">Finish at last crossing</button></div>`:""}
+        ${possibleDnf?`<div class="flagrow"><span class="pill warn">No finish recorded</span></div>
+          <form class="flagrow" id="addFinish" data-rid="${x.id}"><label class="small" for="af-${x.id}">Finished at</label><input type="text" id="af-${x.id}" inputmode="numeric" value="${fmt(Math.max((c.finishAt||0)+1000,x.last+(x.avg||0))-race.startAt)}" style="width:6em" aria-label="Estimated finish, race time"><button class="btn sm" type="submit">Add finish</button></form>
+          <div class="flagrow"><button class="btn sm ghost" data-finishlast="${x.id}">Stopped at last crossing</button><button class="btn sm ghost" data-dnf="${x.id}">Mark DNF</button></div>
+          <p class="note" style="margin:4px 0 0">The time is a guess: their last crossing plus a usual lap. If someone passed them on the last lap, make it just after that rider's finish.</p>`:""}
         ${x.dnf?`<div class="flagrow"><button class="btn sm ghost" data-dnf="${x.id}">Undo DNF</button></div>`:""}
-        ${x.finishedLast&&!x.dnf?`<div class="flagrow"><span class="pill">Finished at last crossing</span><button class="btn sm ghost" data-finishlast="${x.id}">Undo</button></div>`:""}
+        ${x.finishedLast&&!x.dnf?`<div class="flagrow"><span class="pill">Stopped at last crossing</span><button class="btn sm ghost" data-finishlast="${x.id}">Undo</button></div>`:""}
         ${x.dns?`<div class="flagrow"><span class="pill">Did not start</span>${x.ignored?`<span class="small muted">${x.ignored} tap${x.ignored>1?"s":""} ignored</span>`:""}<button class="btn sm ghost" data-dns="${x.id}">Undo DNS</button></div>`
           :view.lapEdit===x.id?`<div class="flagrow"><span class="pill">Editing laps below</span></div>`:`<div class="flagrow"><button class="btn sm ghost" data-lapedit="${x.id}">Edit laps${riderEditCount(race,x.id)?" (edited)":""}</button><button class="btn sm ghost" data-dns="${x.id}">Mark DNS</button></div>`}
       </td><td class="r t">${row.status==="dnf"||row.status==="dns"?(row.laps||"–"):row.laps}</td><td class="r t">${row.time!=null?fmt(row.time):"–"}</td><td class="r t">${esc(row.gap)}</td></tr>${view.lapEdit===x.id&&!x.dns?`<tr class="editrow"><td colspan="5">${renderLapEditor(race,x)}</td></tr>`:""}`}).join("")}
@@ -671,7 +674,7 @@ function renderReview(race,s){
   const pub=race.published;
   return `<div class="stack">
     <div class="banner ${flags?"":"fin"}"><p>${!ended?"The race is still running. Results here update live.":flags?`<b>${flags} thing${flags>1?"s":""} to check</b> before publishing. Highlighted laps are about twice or half the rider's usual lap.`:"<b>No problems spotted.</b> Ready to publish."}</p>
-    ${ended&&noFin.length>1?`<button class="btn sm" data-act="finishlastall">Finish all ${noFin.length} at their last crossing</button>`:""}
+    ${ended&&noFin.length>1?`<button class="btn sm" data-act="finishlastall">All ${noFin.length} stopped at their last crossing</button>`:""}
     ${ended?`<button class="btn sm primary" data-act="publish">${pub?"Republish results":"Publish results"}</button>`:""}</div>
     ${pub?`<p class="note">Published ${new Date(pub.at).toLocaleString()}. Changes here go public only when you republish.</p>`:""}
     ${ended?`<form class="card" id="raceLaps"><div class="spread"><label for="rl-n">Laps the winner raced</label>
@@ -866,6 +869,7 @@ document.addEventListener("submit",async e=>{
   if(f.id==="raceLaps"){ const n=Math.round(+$("#rl-n").value); if(!(n>=1&&n<=99)){ toast("Type the number of laps, like 8"); return }
     setRace(view.raceId,{targetLaps:n}); toast(`Race set to ${n} laps`); return }
   if(f.id==="lapTime"){ if(lapAction("time",f.dataset.rid,+f.dataset.i,$("#lt-val").value)){ view.lapTime=null; render() } return }
+  if(f.id==="addFinish"){ if(addCrossing(f.dataset.rid,$("#af-"+f.dataset.rid).value)) render(); return }
   if(f.id==="addCrossing"){ if(addCrossing(f.dataset.rid,$("#ac-val").value)) render(); return }
   if(f.id==="newRace"){ let rid=null;
     await enqueue("races/new",async()=>{ rid=await createRace({seriesId:view.seriesId,name:$("#nr-name").value.trim()||"Race",date:$("#nr-date").value,durationMin:+$("#nr-min").value||45}) });

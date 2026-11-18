@@ -243,10 +243,15 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok(await p.isVisible('[data-act=finishlastall]'),'bulk finish button shown when several have no finish');
   await p.click('[data-finishlast=ex17]');await p.waitForTimeout(150);
   ok(await p.evaluate(()=>window.__store.get('races/bc-r1').finishLast.includes('ex17')),'finish at last crossing saved');
-  const r17=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='17'});return {pos:tr.querySelector('.pos').textContent,fin:!!tr.textContent.includes('Finished at last crossing'),laps:tr.querySelector('td:nth-child(3)').textContent.trim()}});
+  const r17=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='17'});return {pos:tr.querySelector('.pos').textContent,fin:!!tr.textContent.includes('Stopped at last crossing'),laps:tr.querySelector('td:nth-child(3)').textContent.trim()}});
   ok(/^\d+$/.test(r17.pos)&&r17.fin&&r17.laps==='3','rider who stopped is placed on their laps, no extra lap '+JSON.stringify(r17));
   await p.click('[data-finishlast=ex17]');await p.waitForTimeout(150);
   ok(await p.isVisible('text=No finish recorded'),'undo finish at last crossing');
+  const est=await p.inputValue('#af-ex17');
+  await p.click('#addFinish[data-rid=ex17] button');await p.waitForTimeout(150);
+  const r17b=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='17'});return {pos:tr.querySelector('.pos').textContent,laps:tr.querySelector('td:nth-child(3)').textContent.trim(),nofin:tr.textContent.includes('No finish recorded')}});
+  ok(/^\d+$/.test(r17b.pos)&&r17b.laps==='4'&&!r17b.nofin,'add estimated finish ('+est+') gives one more lap and a finish '+JSON.stringify(r17b));
+  await p.click('[data-lapedit=ex17]');await p.click('[data-lapreset=ex17]');await p.click('[data-lapreset=ex17]');await p.waitForTimeout(150);
   await p.click('[data-act=finishlastall]');await p.waitForTimeout(150);
   ok(!(await p.isVisible('text=No finish recorded')),'finish all at last crossing');
   ok(p.errs.length===0,'finish at last crossing: no errors '+p.errs);
