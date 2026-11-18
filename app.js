@@ -90,6 +90,9 @@ function compute(race, s, now){
   for(const id in R){
     const x=R[id]; let counted=x.all, fin=false, finishT=null;
     if(finishAt!=null){const i=x.all.findIndex(c=>c.t>=finishAt); if(i>=0){counted=x.all.slice(0,i+1);fin=true;finishT=x.all[i].t}}
+    // Organiser said this rider stopped at their last recorded crossing (e.g. pulled, or stopped before the winner finished)
+    x.finishedLast=false;
+    if(!fin&&x.all.length&&(race.finishLast||[]).includes(id)){ fin=true; finishT=x.all[x.all.length-1].t; x.finishedLast=true }
     x.cr=counted; x.laps=counted.length; x.fin=fin; x.finishT=finishT;
     x.lapTimes=counted.map((c,i)=>c.t-(i?counted[i-1].t:start));
     x.last=x.laps?counted[x.laps-1].t:start;
@@ -173,7 +176,9 @@ function renderLapEditor(race,x){
   </div>` }
 function flagsFor(x){
   const out=[]; const lt=x.lapTimes; if(lt.length<3)return out;
-  const med=median(lt.slice(1));
+  // Compare with the rider's normal lap. The median alone fails when several laps are doubled
+  // (e.g. 6:46, 12:52, 12:40, 6:27), so also use the second-fastest lap, which one stray short lap can't drag down.
+  const sorted=[...lt].sort((a,b)=>a-b), med=Math.min(median(lt.slice(1)),sorted[1]);
   lt.forEach((v,i)=>{ const ref=i===0?med*1.1:med;
     if(v>ref*1.65) out.push({type:"missed",lap:i,at:(i?x.cr[i-1].t:null),insertT:Math.round((i?x.cr[i-1].t:x.cr[0].t-v)+v/2)});
     else if(i>0&&v<med*0.5) out.push({type:"short",lap:i,tapId:x.cr[i].id});
@@ -531,7 +536,7 @@ function renderHelp(){
     step("Check-in and timing","You can do these yourself or leave them to your timekeepers. The steps are the same: see the Timekeepers guide."),
     step("New rider on the day","On the Check-in tab, use <i>New rider today</i>. They are added to the series and checked in. Timekeepers can do this too, and their new riders appear in the series as soon as you open Lapboard."),
   ])+sec("After the race",[
-    step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i>: tap <i>Mark DNF</i> or <i>Add finish now</i>."),
+    step("Review","The Review tab shows every rider's laps and flags anything odd. <i>Lap looks like 2 laps</i>: tap <i>Add missed lap</i>. <i>Lap is very short</i>: tap <i>Remove that tap</i>. <i>No finish recorded</i> (they stopped before the winner finished): tap <i>Finish at last crossing</i> to place them by laps and time, or <i>Mark DNF</i>."),
     step("Fix any lap yourself","Tap <i>Edit laps</i> under a rider. <i>Split</i> turns one long lap into two, <i>Delete</i> removes a crossing (joining it to the next lap), and <i>Change time</i> moves a crossing. Type a missing one under <i>Add a crossing</i>, as race time like 23:15. Positions, laps and gaps update straight away. The original taps are kept, so <i>Undo all changes</i> puts that rider back."),
     step("Someone checked in by mistake?","Tap <i>Mark DNS</i> under their name on the Review tab. Any taps on their number are ignored and they show as DNS. If the lap count looks wrong (for example a stray tap made it 30 laps), type the real number in <i>Laps the winner raced</i>."),
     step("Publish","Tap <i>Publish results</i>. The race appears on the public results page and the series standings update. If you change anything later, tap <i>Republish results</i>."),
@@ -645,7 +650,7 @@ function liveUpdate(){
 function renderReview(race,s){
   if(!race.startAt) return `<div class="stack"><div class="card empty">Nothing to review until the race has started.</div></div>`;
   const now=Date.now(), {c,out}=rankings(race,s,now), ended=race.status==="done"||race.status==="published";
-  let flags=0;
+  let flags=0; const noFin=ended?Object.values(c.R).filter(x=>!x.fin&&!x.dnf&&!x.dns&&x.laps>0).map(x=>x.id):[];
   const sec=Object.entries(CATS).map(([cat,label])=>{ const rows=out[cat]; if(!rows.length)return "";
     return `<div class="card"><h2>${label}</h2><div class="tbl-wrap"><table><thead><tr><th>Pos</th><th>Rider</th><th class="r">Laps</th><th class="r">Time</th><th class="r">Gap</th></tr></thead><tbody>
     ${rows.map(row=>{ const x=row.x, fl=flagsFor(x); flags+=fl.length;
@@ -656,8 +661,9 @@ function renderReview(race,s){
         ${x.lapTimes.length?`<div class="laps">${x.lapTimes.map((v,i)=>`<span class="${missedLaps.has(i)?"flag":shortLaps.has(i)?"short":""}"><b class="ln">L${i+1}</b>${fmt(v)}</span>`).join("")}</div>`:""}
         ${fl.map(f=>f.type==="missed"?`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} looks like 2 laps</span><button class="btn sm" data-addtap="${x.id}|${f.insertT}">Add missed lap</button></div>`
           :`<div class="flagrow"><span class="pill warn">Lap ${f.lap+1} is very short</span><button class="btn sm" data-rmtap="${f.tapId}">Remove that tap</button></div>`).join("")}
-        ${possibleDnf?`<div class="flagrow"><span class="pill warn">No finish recorded</span><button class="btn sm" data-dnf="${x.id}">Mark DNF</button><button class="btn sm ghost" data-addfinish="${x.id}">Add finish now</button></div>`:""}
+        ${possibleDnf?`<div class="flagrow"><span class="pill warn">No finish recorded</span><button class="btn sm" data-dnf="${x.id}">Mark DNF</button><button class="btn sm" data-finishlast="${x.id}">Finish at last crossing</button></div>`:""}
         ${x.dnf?`<div class="flagrow"><button class="btn sm ghost" data-dnf="${x.id}">Undo DNF</button></div>`:""}
+        ${x.finishedLast&&!x.dnf?`<div class="flagrow"><span class="pill">Finished at last crossing</span><button class="btn sm ghost" data-finishlast="${x.id}">Undo</button></div>`:""}
         ${x.dns?`<div class="flagrow"><span class="pill">Did not start</span>${x.ignored?`<span class="small muted">${x.ignored} tap${x.ignored>1?"s":""} ignored</span>`:""}<button class="btn sm ghost" data-dns="${x.id}">Undo DNS</button></div>`
           :view.lapEdit===x.id?`<div class="flagrow"><span class="pill">Editing laps below</span></div>`:`<div class="flagrow"><button class="btn sm ghost" data-lapedit="${x.id}">Edit laps${riderEditCount(race,x.id)?" (edited)":""}</button><button class="btn sm ghost" data-dns="${x.id}">Mark DNS</button></div>`}
       </td><td class="r t">${row.status==="dnf"||row.status==="dns"?(row.laps||"–"):row.laps}</td><td class="r t">${row.time!=null?fmt(row.time):"–"}</td><td class="r t">${esc(row.gap)}</td></tr>${view.lapEdit===x.id&&!x.dns?`<tr class="editrow"><td colspan="5">${renderLapEditor(race,x)}</td></tr>`:""}`}).join("")}
@@ -665,6 +671,7 @@ function renderReview(race,s){
   const pub=race.published;
   return `<div class="stack">
     <div class="banner ${flags?"":"fin"}"><p>${!ended?"The race is still running. Results here update live.":flags?`<b>${flags} thing${flags>1?"s":""} to check</b> before publishing. Highlighted laps are about twice or half the rider's usual lap.`:"<b>No problems spotted.</b> Ready to publish."}</p>
+    ${ended&&noFin.length>1?`<button class="btn sm" data-act="finishlastall">Finish all ${noFin.length} at their last crossing</button>`:""}
     ${ended?`<button class="btn sm primary" data-act="publish">${pub?"Republish results":"Publish results"}</button>`:""}</div>
     ${pub?`<p class="note">Published ${new Date(pub.at).toLocaleString()}. Changes here go public only when you republish.</p>`:""}
     ${ended?`<form class="card" id="raceLaps"><div class="spread"><label for="rl-n">Laps the winner raced</label>
@@ -794,9 +801,8 @@ document.addEventListener("click",e=>{
       try{ await deleteRace(rid); toast(`${n} deleted for good`) }catch(e){ console.error(e); toast("Couldn't delete the race. Try again") } render() }); return }
   if(t.dataset.addtap){ const [r,tt]=t.dataset.addtap.split("|"); const race=getRace(view.raceId); const ed=race.edits||{};
     setRace(race.id,{edits:{removed:ed.removed||[],added:[...(ed.added||[]),{id:"e-"+uid(),r,t:+tt}]}}); toast("Lap added"); return }
-  if(t.dataset.addfinish){ const race=getRace(view.raceId), c=compute(race,series[race.seriesId],Date.now()), x=c.R[t.dataset.addfinish];
-    const at=Math.max(c.finishAt||0,x.last+DEDUP_MS)+1000; const ed=race.edits||{};
-    setRace(race.id,{edits:{removed:ed.removed||[],added:[...(ed.added||[]),{id:"e-"+uid(),r:x.id,t:at}]}}); toast("Finish added"); return }
+  if(t.dataset.finishlast){ const race=getRace(view.raceId), id=t.dataset.finishlast, f=new Set(race.finishLast||[]); const on=!f.has(id); on?f.add(id):f.delete(id);
+    setRace(race.id,{finishLast:[...f]}); const r=series[race.seriesId].riders[id]; toast(`#${r.num} ${on?"finishes at their last crossing":"has no finish again"}`); return }
   if(t.dataset.lapedit!==undefined){ view.lapEdit=t.dataset.lapedit||null; view.lapTime=null; render();
     if(view.lapEdit){ const el=document.getElementById("lapedit-"+view.lapEdit); if(el&&el.scrollIntoView)el.scrollIntoView({block:"nearest"}) } return }
   if(t.dataset.laptime!==undefined){ view.lapTime=t.dataset.laptime||null; view.lapTimeVal=null; render(); const el=$("#lt-val"); if(el){el.focus();el.select()} return }
@@ -828,6 +834,8 @@ document.addEventListener("click",e=>{
   else if(act==="lapsplus") setRace(race.id,{targetLaps:race.targetLaps+1});
   else if(act==="lapsminus"){ const c=compute(race,series[race.seriesId],Date.now()); if(race.targetLaps-1>(c.leader?c.leader.laps:0)+1) setRace(race.id,{targetLaps:race.targetLaps-1}); }
   else if(act==="dnfmode"){ dnfMode=!dnfMode; render(); }
+  else if(act==="finishlastall"){ const c=compute(race,series[race.seriesId],Date.now()); const ids=Object.values(c.R).filter(x=>!x.fin&&!x.dnf&&!x.dns&&x.laps>0).map(x=>x.id);
+    setRace(race.id,{finishLast:[...new Set([...(race.finishLast||[]),...ids])]}); toast(`${ids.length} riders finish at their last crossing`) }
   else if(act==="reopen") { setRace(race.id,{status:"running",endedAt:null}); go({tab:"timing"}) }
   else if(act==="reset") arm("reset",async()=>{ const ids=Object.keys(tapDocs); ownTaps=[]; ownRemoved=new Set();
       setRace(race.id,{startAt:null,status:"setup",targetLaps:null,lapsFrom:null,dnf:[],dns:[],endedAt:null,...(admin()?{edits:{added:[],removed:[]}}:{})});

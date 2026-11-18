@@ -233,6 +233,23 @@ let fails=0; const ok=(c,m)=>{console.log((c?'PASS ':'FAIL ')+m); if(!c)fails++}
   ok((await p.textContent('h1')).includes('Your series'),'back from series goes home');
   ok(!(await p.isVisible('.navback')),'no back button on home');
   ok(p.errs.length===0,'lap editing: no errors '+p.errs);
+  // riders who stopped before the winner finished; doubled laps that outnumber normal ones
+  p=await page('#/admin');await p.click('text=Sign in with Google');await p.waitForTimeout(300);
+  await p.evaluate(()=>{const st=1791108000000,m=60000;window.__MOCK_BACKEND.db.doc('races/bc-r1/live/k1/taps/jt').set({device:'jt',taps:[[6.77],[19.63],[32.3],[38.75]].map(([v],i)=>({id:'jt'+i,r:'ex29',t:st+v*m}))})});
+  await p.click('text=Biscuit Cup 2026');await p.waitForTimeout(100);await p.click('text=Round 1 (example)');await p.waitForTimeout(200);
+  await p.click('[data-tab=review]');await p.waitForTimeout(150);
+  const missed=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='39'});return tr?tr.querySelectorAll('.laps span.flag').length:-1});
+  ok(missed===2,'two doubled laps out of four are both flagged: '+missed);
+  ok(await p.isVisible('[data-act=finishlastall]'),'bulk finish button shown when several have no finish');
+  await p.click('[data-finishlast=ex17]');await p.waitForTimeout(150);
+  ok(await p.evaluate(()=>window.__store.get('races/bc-r1').finishLast.includes('ex17')),'finish at last crossing saved');
+  const r17=await p.evaluate(()=>{const tr=[...document.querySelectorAll('#app tr')].find(r=>{const pl=r.querySelector('.plate-sm');return pl&&pl.textContent=='17'});return {pos:tr.querySelector('.pos').textContent,fin:!!tr.textContent.includes('Finished at last crossing'),laps:tr.querySelector('td:nth-child(3)').textContent.trim()}});
+  ok(/^\d+$/.test(r17.pos)&&r17.fin&&r17.laps==='3','rider who stopped is placed on their laps, no extra lap '+JSON.stringify(r17));
+  await p.click('[data-finishlast=ex17]');await p.waitForTimeout(150);
+  ok(await p.isVisible('text=No finish recorded'),'undo finish at last crossing');
+  await p.click('[data-act=finishlastall]');await p.waitForTimeout(150);
+  ok(!(await p.isVisible('text=No finish recorded')),'finish all at last crossing');
+  ok(p.errs.length===0,'finish at last crossing: no errors '+p.errs);
   // a stray tap that makes the leader's lap 2 far too short must not set a silly lap count
   p=await page('#/t/bc-r2/k2',()=>{window.__seedHook=1});
   await p.evaluate(()=>{const now=Date.now(),st=now-7*60000;window.__store.set('races/bc-r2/live/k2',{...window.__store.get('races/bc-r2/live/k2'),status:'running',startAt:st,targetLaps:null,lapsFrom:null});
